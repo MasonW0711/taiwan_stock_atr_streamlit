@@ -162,6 +162,11 @@ def make_empty_margin_df() -> pd.DataFrame:
     return pd.DataFrame(columns=MARGIN_REQUIRED_COLUMNS)
 
 
+def make_empty_institutional_df() -> pd.DataFrame:
+    """建立空白法人買賣超資料表，供官方資料合併時使用。"""
+    return pd.DataFrame(columns=["symbol", "date", "foreign_buy_sell", "investment_trust_buy_sell"])
+
+
 def make_empty_stop_history_df() -> pd.DataFrame:
     """建立空白停利歷史資料表，供首次計算或缺檔時使用。"""
     return pd.DataFrame(columns=STOP_HISTORY_REQUIRED_COLUMNS)
@@ -331,6 +336,31 @@ def build_tpex_margin_url(target_date: date) -> str:
     return f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?{query}"
 
 
+def build_twse_institutional_url(target_date: date) -> str:
+    """建立證交所三大法人買賣超 JSON 端點。"""
+    query = urlencode(
+        {
+            "date": target_date.strftime("%Y%m%d"),
+            "selectType": "ALLBUT0999",
+            "response": "json",
+        }
+    )
+    return f"https://www.twse.com.tw/rwd/zh/fund/T86?{query}"
+
+
+def build_tpex_institutional_url(target_date: date) -> str:
+    """建立櫃買中心三大法人買賣超 JSON 端點。"""
+    query = urlencode(
+        {
+            "l": "zh-tw",
+            "o": "json",
+            "d": format_roc_date(target_date),
+            "s": "0,asc",
+        }
+    )
+    return f"https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php?{query}"
+
+
 def build_official_margin_row(
     symbol: str,
     record_date: str,
@@ -363,13 +393,33 @@ def build_official_margin_row(
     }
 
 
+def build_official_institutional_row(
+    symbol: str,
+    record_date: str,
+    foreign_buy_sell: Any,
+    investment_trust_buy_sell: Any,
+) -> dict[str, Any]:
+    """把官方法人欄位整理成系統既有的 margin.csv 欄位結構。"""
+    return {
+        "symbol": symbol,
+        "date": record_date,
+        "foreign_buy_sell": parse_official_number(foreign_buy_sell),
+        "investment_trust_buy_sell": parse_official_number(investment_trust_buy_sell),
+    }
+
+
+def normalize_official_fields(fields: list[Any]) -> list[str]:
+    """把官方欄位名稱正規化，方便欄位定位。"""
+    return [unicodedata.normalize("NFKC", str(field or "")).strip() for field in fields]
+
+
 def parse_twse_margin_payload(payload: dict[str, Any]) -> tuple[pd.DataFrame, str]:
     """解析證交所融資融券彙總資料。"""
     status_text = str(payload.get("stat", "")).strip()
     if status_text != "OK":
         raise ValueError(status_text or "證交所端點未回傳有效資料")
 
-    record_date = pd.to_datetime(payload.get("date"), format="%Y%m%d", errors="coerce")
+    record_date = pd.to_datetime(str(payload.get("date") or ""), format="%Y%m%d", errors="coerce")
     if pd.isna(record_date):
         raise ValueError("證交所資料缺少有效日期")
 
@@ -418,7 +468,7 @@ def parse_tpex_margin_payload(payload: dict[str, Any]) -> tuple[pd.DataFrame, st
     if status_text != "ok":
         raise ValueError(str(payload.get("stat", "")).strip() or "櫃買中心端點未回傳有效資料")
 
-    record_date = pd.to_datetime(payload.get("date"), format="%Y%m%d", errors="coerce")
+    record_date = pd.to_datetime(str(payload.get("date") or ""), format="%Y%m%d", errors="coerce")
     if pd.isna(record_date):
         raise ValueError("櫃買中心資料缺少有效日期")
 
@@ -459,13 +509,200 @@ def parse_tpex_margin_payload(payload: dict[str, Any]) -> tuple[pd.DataFrame, st
     return pd.DataFrame(rows, columns=MARGIN_REQUIRED_COLUMNS), normalized_date
 
 
-def fetch_market_margin_data(
+def parse_twse_institutional_payload(payload: dict[str, Any]) -> tuple[pd.DataFrame, str]:
+    """解析證交所三大法人買賣超資料。"""
+    status_text = str(payload.get("stat", "")).strip()
+    if status_text != "OK":
+        raise ValueError(status_text or "證交所端點未回傳有效法人資料")
+
+    record_date = pd.to_datetime(str(payload.get("date") or ""), format="%Y%m%d", errors="coerce")
+    if pd.isna(record_date):
+        raise ValueError("證交所法人資料缺少有效日期")
+
+    fields = normalize_official_fields(payload.get("fields") or [])
+    data = payload.get("data") or []
+    if not fields or not data:
+        raise ValueError("證交所該日無法人買賣超明細")
+
+    foreign_index = -1
+    for candidate in [
+        "外陸資買賣超股數(不含外資自營商)",
+        "外資及陸資買賣超股數(不含外資自營商)",
+    ]:
+        if candidate in fields:
+            foreign_index = fields.index(candidate)
+            break
+
+    if foreign_index < 0:
+        for index, field_name in enumerate(fields):
+            if (
+                "買賣超" in field_name
+                and "不含外資自營商" in field_name
+                and ("外陸資" in field_name or "外資及陸資" in field_name)
+            ):
+                foreign_index = index
+                break
+
+    investment_trust_index = -1
+    for candidate in ["投信買賣超股數", "投信買賣超"]:
+        if candidate in fields:
+            investment_trust_index = fields.index(candidate)
+            break
+
+    if foreign_index < 0 or investment_trust_index < 0:
+        raise ValueError("證交所法人資料缺少外資或投信買賣超欄位")
+
+    normalized_date = record_date.strftime("%Y-%m-%d")
+    rows: list[dict[str, Any]] = []
+    for item in data:
+        if len(item) <= max(foreign_index, investment_trust_index):
+            continue
+
+        stock_code = str(item[0]).strip().upper()
+        if not stock_code:
+            continue
+
+        rows.append(
+            build_official_institutional_row(
+                symbol=f"{stock_code}.TW",
+                record_date=normalized_date,
+                foreign_buy_sell=item[foreign_index],
+                investment_trust_buy_sell=item[investment_trust_index],
+            )
+        )
+
+    if not rows:
+        raise ValueError("證交所該日無可用法人買賣超")
+
+    return pd.DataFrame(rows, columns=make_empty_institutional_df().columns), normalized_date
+
+
+def parse_tpex_institutional_payload(payload: dict[str, Any]) -> tuple[pd.DataFrame, str]:
+    """解析櫃買中心三大法人買賣超資料。"""
+    status_text = str(payload.get("stat", "")).strip().lower()
+    if status_text != "ok":
+        raise ValueError(str(payload.get("stat", "")).strip() or "櫃買中心端點未回傳有效法人資料")
+
+    record_date = pd.to_datetime(str(payload.get("date") or ""), format="%Y%m%d", errors="coerce")
+    if pd.isna(record_date):
+        raise ValueError("櫃買中心法人資料缺少有效日期")
+
+    detail_table = None
+    for table in payload.get("tables") or []:
+        fields = normalize_official_fields(table.get("fields") or [])
+        if fields and fields[0] == "代號" and fields[-1] == "三大法人買賣超股數合計":
+            detail_table = table
+            break
+
+    if detail_table is None or not detail_table.get("data"):
+        raise ValueError("櫃買中心該日無法人買賣超明細")
+
+    normalized_date = record_date.strftime("%Y-%m-%d")
+    foreign_buy_sell_index = 4
+    investment_trust_buy_sell_index = 13
+
+    rows: list[dict[str, Any]] = []
+    for item in detail_table.get("data", []):
+        if len(item) <= investment_trust_buy_sell_index:
+            continue
+
+        stock_code = str(item[0]).strip().upper()
+        if not stock_code:
+            continue
+
+        rows.append(
+            build_official_institutional_row(
+                symbol=f"{stock_code}.TWO",
+                record_date=normalized_date,
+                foreign_buy_sell=item[foreign_buy_sell_index],
+                investment_trust_buy_sell=item[investment_trust_buy_sell_index],
+            )
+        )
+
+    if not rows:
+        raise ValueError("櫃買中心該日無可用法人買賣超")
+
+    return pd.DataFrame(rows, columns=make_empty_institutional_df().columns), normalized_date
+
+
+def merge_official_market_data(margin_df: pd.DataFrame, institutional_df: pd.DataFrame) -> pd.DataFrame:
+    """合併單一市場的官方融資與法人買賣超資料。"""
+    if margin_df.empty and institutional_df.empty:
+        return make_empty_margin_df()
+
+    if margin_df.empty:
+        combined_df = institutional_df.copy()
+    elif institutional_df.empty:
+        combined_df = margin_df.copy()
+    else:
+        combined_df = margin_df.merge(
+            institutional_df.rename(columns={"date": "institutional_date"}),
+            on="symbol",
+            how="outer",
+            suffixes=("", "_institutional"),
+        )
+        margin_dates = pd.Series(
+            pd.to_datetime(combined_df["date"].tolist(), errors="coerce"),
+            index=combined_df.index,
+        )
+        institutional_dates = pd.Series(
+            pd.to_datetime(combined_df["institutional_date"].tolist(), errors="coerce"),
+            index=combined_df.index,
+        )
+        combined_df["date"] = pd.concat(
+            [
+                margin_dates,
+                institutional_dates,
+            ],
+            axis=1,
+        ).max(axis=1)
+        for column in ["foreign_buy_sell", "investment_trust_buy_sell"]:
+            institutional_column = f"{column}_institutional"
+            if institutional_column in combined_df.columns:
+                combined_df[column] = combined_df[column].combine_first(combined_df[institutional_column])
+        combined_df = combined_df.drop(columns=["institutional_date"], errors="ignore")
+        combined_df = combined_df.drop(
+            columns=["foreign_buy_sell_institutional", "investment_trust_buy_sell_institutional"],
+            errors="ignore",
+        )
+
+    for column in MARGIN_REQUIRED_COLUMNS:
+        if column not in combined_df.columns:
+            combined_df[column] = float("nan") if column != "symbol" else ""
+
+    combined_df["date"] = pd.to_datetime(combined_df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return combined_df[MARGIN_REQUIRED_COLUMNS].sort_values("symbol").reset_index(drop=True)
+
+
+def build_market_source_summary(
     market_label: str,
+    margin_date: str | None,
+    institutional_date: str | None,
+) -> str:
+    """整理單一市場的官方資料來源摘要文字。"""
+    if margin_date and institutional_date:
+        if margin_date == institutional_date:
+            return f"{market_label} {margin_date}"
+        return f"{market_label} 融資 {margin_date}／法人 {institutional_date}"
+
+    if margin_date:
+        return f"{market_label} 融資 {margin_date}"
+
+    if institutional_date:
+        return f"{market_label} 法人 {institutional_date}"
+
+    return ""
+
+
+def fetch_market_official_data(
+    market_label: str,
+    dataset_label: str,
     reference_date: date,
     url_builder: Any,
     payload_parser: Any,
+    empty_df_factory: Any,
 ) -> dict[str, Any]:
-    """往前回退到最近可用交易日，抓取單一市場的官方融資資料。"""
+    """往前回退到最近可用交易日，抓取單一市場的官方資料。"""
     recent_errors: list[str] = []
 
     for offset in range(OFFICIAL_MARGIN_LOOKBACK_DAYS + 1):
@@ -480,42 +717,79 @@ def fetch_market_margin_data(
 
     summarized_errors = "；".join(recent_errors[-3:]) if recent_errors else "無額外錯誤訊息"
     return {
-        "data": make_empty_margin_df(),
+        "data": empty_df_factory(),
         "used_date": None,
-        "warning": f"{market_label} 最近 {OFFICIAL_MARGIN_LOOKBACK_DAYS + 1} 天查無可用官方融資資料：{summarized_errors}",
+        "warning": f"{market_label} 最近 {OFFICIAL_MARGIN_LOOKBACK_DAYS + 1} 天查無可用{dataset_label}：{summarized_errors}",
     }
 
 
 def download_official_margin_data_impl(reference_date_text: str | None = None) -> dict[str, Any]:
-    """自動抓取證交所與櫃買中心最近可用的官方融資資料。"""
+    """自動抓取證交所與櫃買中心最近可用的官方融資與法人資料。"""
     reference_timestamp = pd.to_datetime(reference_date_text or date.today().isoformat(), errors="coerce")
     reference_day = reference_timestamp.date() if pd.notna(reference_timestamp) else date.today()
 
     market_configs = [
-        ("上市", build_twse_margin_url, parse_twse_margin_payload),
-        ("上櫃", build_tpex_margin_url, parse_tpex_margin_payload),
+        {
+            "market_label": "上市",
+            "margin_url_builder": build_twse_margin_url,
+            "margin_parser": parse_twse_margin_payload,
+            "institutional_url_builder": build_twse_institutional_url,
+            "institutional_parser": parse_twse_institutional_payload,
+        },
+        {
+            "market_label": "上櫃",
+            "margin_url_builder": build_tpex_margin_url,
+            "margin_parser": parse_tpex_margin_payload,
+            "institutional_url_builder": build_tpex_institutional_url,
+            "institutional_parser": parse_tpex_institutional_payload,
+        },
     ]
 
     frames: list[pd.DataFrame] = []
     source_parts: list[str] = []
     warnings: list[str] = []
 
-    for market_label, url_builder, payload_parser in market_configs:
-        market_result = fetch_market_margin_data(market_label, reference_day, url_builder, payload_parser)
-        market_df = market_result["data"]
+    for market_config in market_configs:
+        market_label = market_config["market_label"]
+        margin_result = fetch_market_official_data(
+            market_label,
+            "官方融資資料",
+            reference_day,
+            market_config["margin_url_builder"],
+            market_config["margin_parser"],
+            make_empty_margin_df,
+        )
+        institutional_result = fetch_market_official_data(
+            market_label,
+            "官方法人資料",
+            reference_day,
+            market_config["institutional_url_builder"],
+            market_config["institutional_parser"],
+            make_empty_institutional_df,
+        )
+
+        market_df = merge_official_market_data(margin_result["data"], institutional_result["data"])
         if not market_df.empty:
             frames.append(market_df)
-            if market_result["used_date"]:
-                source_parts.append(f"{market_label} {market_result['used_date']}")
-        elif market_result["warning"]:
-            warnings.append(market_result["warning"])
+
+        source_summary_part = build_market_source_summary(
+            market_label,
+            margin_result["used_date"],
+            institutional_result["used_date"],
+        )
+        if source_summary_part:
+            source_parts.append(source_summary_part)
+
+        for warning_text in [margin_result["warning"], institutional_result["warning"]]:
+            if warning_text:
+                warnings.append(warning_text)
 
     combined_df = pd.concat(frames, ignore_index=True) if frames else make_empty_margin_df()
-    source_summary = "已自動抓取官方融資資料：" + "、".join(source_parts) if source_parts else ""
+    source_summary = "已自動抓取官方融資與法人資料：" + "、".join(source_parts) if source_parts else ""
 
     fetch_error = ""
     if combined_df.empty:
-        fetch_error = "目前無法自動取得官方融資資料。"
+        fetch_error = "目前無法自動取得官方融資與法人資料。"
         if warnings:
             fetch_error = fetch_error + " " + "；".join(warnings)
 
@@ -940,9 +1214,9 @@ def finalize_portfolio_input(portfolio_df: pd.DataFrame, default_category: str =
     return working_df
 
 
-# 3. 載入融資資料；若未上傳則改抓證交所與櫃買中心官方資料。
+# 3. 載入融資資料；若未上傳則改抓證交所與櫃買中心官方融資與法人資料。
 def load_margin_data(uploaded_file: Any, reference_date: date | None = None) -> pd.DataFrame:
-    """載入使用者上傳的融資資料，或自動抓取官方融資資料。"""
+    """載入使用者上傳的融資資料，或自動抓取官方融資與法人資料。"""
     if uploaded_file is None:
         official_result = download_official_margin_data((reference_date or date.today()).isoformat())
         margin_df = official_result["data"].copy()
@@ -1726,7 +2000,7 @@ def main() -> None:
             accept_multiple_files=True,
             help="若券商系統無法匯出 CSV，可上傳持股截圖，系統會先做 OCR 草稿，再由你確認後計算。",
         )
-        margin_file = st.file_uploader("上傳 margin.csv（選填，可覆蓋官方融資資料）", type=["csv"])
+        margin_file = st.file_uploader("上傳 margin.csv（選填，可覆蓋官方融資／法人資料）", type=["csv"])
         stop_history_file = st.file_uploader("上傳 stop_history.csv（選填）", type=["csv"])
 
         st.caption("截圖請盡量裁成持股表格畫面，最好同時包含股票代號、名稱、股數與成本價。")
@@ -1899,9 +2173,9 @@ def main() -> None:
                 if margin_df.attrs.get("source_summary"):
                     st.info(margin_df.attrs["source_summary"])
                 if margin_df.attrs.get("fetch_warnings") and not margin_df.attrs.get("fetch_error"):
-                    st.warning("部分官方融資資料未取得：" + "；".join(margin_df.attrs["fetch_warnings"]))
+                    st.warning("部分官方融資／法人資料未取得：" + "；".join(margin_df.attrs["fetch_warnings"]))
                 if margin_df.attrs.get("fetch_error"):
-                    st.warning(f"官方融資資料自動抓取失敗：{margin_df.attrs['fetch_error']}")
+                    st.warning(f"官方融資／法人資料自動抓取失敗：{margin_df.attrs['fetch_error']}")
 
             if stop_history_df.attrs.get("validation_error"):
                 st.warning(f"stop_history.csv 讀取失敗，將從空白歷史開始：{stop_history_df.attrs['validation_error']}")
