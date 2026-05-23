@@ -58,6 +58,16 @@ OCR_HEADER_KEYWORDS = [
     "張數",
     "可賣",
 ]
+OCR_NON_NAME_TOKENS = {
+    "現股買進",
+    "現股賣出",
+    "零股買進",
+    "零股賣出",
+    "融資買進",
+    "融資賣出",
+    "融券賣出",
+    "融券回補",
+}
 
 REPORT_COLUMNS = [
     "股票代號",
@@ -327,27 +337,44 @@ def parse_portfolio_candidate_line(
     if any(keyword in cleaned_line for keyword in OCR_HEADER_KEYWORDS):
         return None
 
-    code_match = re.search(r"(?<!\d)(\d{4,6})(?!\d)", cleaned_line)
-    if not code_match:
-        return None
+    name_before_code_match = re.search(r"(?P<name>.+?)[（(](?P<code>\d{4,6})[）)]", cleaned_line)
+    leading_name = ""
 
-    symbol = normalize_symbol(code_match.group(1))
-    trailing_text = cleaned_line[code_match.end() :].strip(" :-|")
+    if name_before_code_match:
+        symbol = normalize_symbol(name_before_code_match.group("code"))
+        leading_name = clean_ocr_text(name_before_code_match.group("name")).strip(" :-|")
+        trailing_text = cleaned_line[name_before_code_match.end() :].strip(" :-|")
+    else:
+        code_match = re.search(r"(?<!\d)(\d{4,6})(?!\d)", cleaned_line)
+        if not code_match:
+            return None
+
+        symbol = normalize_symbol(code_match.group(1))
+        leading_name = clean_ocr_text(cleaned_line[: code_match.start()])
+        leading_name = re.sub(r"[（(]+$", "", leading_name).strip(" :-|")
+        trailing_text = cleaned_line[code_match.end() :].lstrip(")）").strip(" :-|")
+
     tokenized_parts = [part for part in re.split(r"\s+", trailing_text) if part]
     name_tokens: list[str] = []
     numeric_tokens: list[str] = []
-    numeric_section_started = False
+
     for part in tokenized_parts:
-        normalized_part = part.replace(",", "")
-        is_numeric_token = bool(re.fullmatch(r"\d+(?:\.\d+)?", normalized_part))
-        if not numeric_section_started and not is_numeric_token:
+        normalized_part = part.replace(",", "").rstrip("%")
+        is_numeric_token = bool(re.fullmatch(r"-?\d+(?:\.\d+)?", normalized_part))
+
+        if part not in OCR_NON_NAME_TOKENS and not is_numeric_token and not leading_name:
             name_tokens.append(part)
-            continue
-        if is_numeric_token:
-            numeric_section_started = True
+
+        if is_numeric_token and not normalized_part.startswith("-"):
             numeric_tokens.append(normalized_part)
 
-    name = " ".join(name_tokens).strip(" :-|") if name_tokens else trailing_text.strip(" :-|")
+        if part in OCR_NON_NAME_TOKENS:
+            continue
+
+        if is_numeric_token and not leading_name:
+            break
+
+    name = leading_name or " ".join(name_tokens).strip(" :-|")
 
     integer_values: list[float] = []
     decimal_values: list[float] = []
@@ -365,7 +392,7 @@ def parse_portfolio_candidate_line(
 
     if integer_values:
         share_candidate = integer_values[0]
-        if len(integer_values) >= 2 and integer_values[0] <= 5000 < integer_values[1]:
+        if not decimal_values and len(integer_values) >= 2 and integer_values[0] <= 5000 < integer_values[1]:
             share_candidate = integer_values[1]
             if not decimal_values:
                 cost_value = float(integer_values[0])
