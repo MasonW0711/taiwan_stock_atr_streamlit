@@ -2,3 +2,5 @@ streamlit
 pandas
 yfinance
 openpyxl
+rapidocr-onnxruntime
+pillow

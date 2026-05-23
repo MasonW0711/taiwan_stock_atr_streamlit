@@ -3,14 +3,18 @@ from __future__ import annotations
 from datetime import date
 from io import BytesIO
 from pathlib import Path
+import re
 from typing import Any
+import unicodedata
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from PIL import Image, ImageOps
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,6 +42,22 @@ DEFAULT_ATR_MULTIPLIERS = {
     "normal": 2.0,
     "high_volatility": 2.5,
 }
+
+OCR_PORTFOLIO_COLUMNS = ["symbol", "name", "shares", "cost", "category", "image_name", "ocr_text"]
+PORTFOLIO_IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
+OCR_HEADER_KEYWORDS = [
+    "代號",
+    "名稱",
+    "股數",
+    "庫存",
+    "均價",
+    "成本",
+    "現價",
+    "損益",
+    "市值",
+    "張數",
+    "可賣",
+]
 
 REPORT_COLUMNS = [
     "股票代號",
@@ -101,6 +121,11 @@ def make_empty_margin_df() -> pd.DataFrame:
 def make_empty_stop_history_df() -> pd.DataFrame:
     """建立空白停利歷史資料表，供首次計算或缺檔時使用。"""
     return pd.DataFrame(columns=STOP_HISTORY_REQUIRED_COLUMNS)
+
+
+def make_empty_ocr_portfolio_df() -> pd.DataFrame:
+    """建立空白的 OCR 持股草稿資料表。"""
+    return pd.DataFrame(columns=OCR_PORTFOLIO_COLUMNS)
 
 
 def validate_required_columns(df: pd.DataFrame, required_columns: list[str]) -> list[str]:
@@ -193,6 +218,254 @@ def load_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
 def load_sample_portfolio() -> pd.DataFrame:
     """載入專案提供的 portfolio_sample.csv，方便使用者下載修改。"""
     return pd.read_csv(PORTFOLIO_SAMPLE_PATH)
+
+
+def clean_ocr_text(text: Any) -> str:
+    """清理 OCR 文字，將全形數字與標點統一成可解析格式。"""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    normalized = normalized.replace("|", " ").replace("_", " ").replace("\t", " ")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+@st.cache_resource(show_spinner=False)
+def get_ocr_engine() -> Any:
+    """延遲載入 OCR 模型，避免在未使用截圖功能時增加啟動成本。"""
+    from rapidocr_onnxruntime import RapidOCR
+
+    return RapidOCR()
+
+
+def extract_text_lines_from_ocr_result(ocr_result: Any) -> list[str]:
+    """將 OCR 偵測框依垂直位置合併成較容易解析的逐行文字。"""
+    if not ocr_result:
+        return []
+
+    detections: list[dict[str, Any]] = []
+    for item in ocr_result:
+        if len(item) < 3:
+            continue
+        box, text, score = item[0], item[1], item[2]
+        if not text or score < 0.35:
+            continue
+        x_positions = [point[0] for point in box]
+        y_positions = [point[1] for point in box]
+        detections.append(
+            {
+                "text": clean_ocr_text(text),
+                "x": min(x_positions),
+                "y": min(y_positions),
+                "y_center": sum(y_positions) / len(y_positions),
+                "height": max(y_positions) - min(y_positions),
+            }
+        )
+
+    if not detections:
+        return []
+
+    detections.sort(key=lambda item: (item["y"], item["x"]))
+    median_height = float(pd.Series([item["height"] for item in detections]).median())
+    line_gap_threshold = max(12.0, median_height * 0.6)
+
+    grouped_lines: list[list[dict[str, Any]]] = []
+    current_group: list[dict[str, Any]] = []
+    current_y_center = 0.0
+    for detection in detections:
+        if not current_group:
+            current_group = [detection]
+            current_y_center = detection["y_center"]
+            continue
+
+        if abs(detection["y_center"] - current_y_center) <= line_gap_threshold:
+            current_group.append(detection)
+            current_y_center = sum(item["y_center"] for item in current_group) / len(current_group)
+        else:
+            grouped_lines.append(sorted(current_group, key=lambda item: item["x"]))
+            current_group = [detection]
+            current_y_center = detection["y_center"]
+
+    if current_group:
+        grouped_lines.append(sorted(current_group, key=lambda item: item["x"]))
+
+    return [clean_ocr_text(" ".join(item["text"] for item in group if item["text"])) for group in grouped_lines]
+
+
+def first_non_empty(series: pd.Series, default_value: Any = "") -> Any:
+    """回傳序列中第一個非空值；若沒有則使用預設值。"""
+    for value in series:
+        if pd.notna(value) and str(value).strip() not in {"", "nan", "None"}:
+            return value
+    return default_value
+
+
+def parse_portfolio_candidate_line(
+    line: str,
+    default_category: str,
+    share_unit_multiplier: int,
+    image_name: str,
+) -> dict[str, Any] | None:
+    """從單行 OCR 文字中盡量推估股票代號、名稱、股數與成本價。"""
+    cleaned_line = clean_ocr_text(line)
+    if not cleaned_line:
+        return None
+
+    if any(keyword in cleaned_line for keyword in OCR_HEADER_KEYWORDS):
+        return None
+
+    code_match = re.search(r"(?<!\d)(\d{4,6})(?!\d)", cleaned_line)
+    if not code_match:
+        return None
+
+    symbol = normalize_symbol(code_match.group(1))
+    trailing_text = cleaned_line[code_match.end() :].strip(" :-|")
+    tokenized_parts = [part for part in re.split(r"\s+", trailing_text) if part]
+    name_tokens: list[str] = []
+    numeric_tokens: list[str] = []
+    numeric_section_started = False
+    for part in tokenized_parts:
+        normalized_part = part.replace(",", "")
+        is_numeric_token = bool(re.fullmatch(r"\d+(?:\.\d+)?", normalized_part))
+        if not numeric_section_started and not is_numeric_token:
+            name_tokens.append(part)
+            continue
+        if is_numeric_token:
+            numeric_section_started = True
+            numeric_tokens.append(normalized_part)
+
+    name = " ".join(name_tokens).strip(" :-|") if name_tokens else trailing_text.strip(" :-|")
+
+    integer_values: list[float] = []
+    decimal_values: list[float] = []
+    for token in numeric_tokens:
+        if len(token) >= 8 and "." not in token:
+            continue
+        numeric_value = float(token)
+        if "." in token:
+            decimal_values.append(numeric_value)
+        else:
+            integer_values.append(numeric_value)
+
+    shares_value: Any = pd.NA
+    cost_value: Any = pd.NA
+
+    if integer_values:
+        share_candidate = integer_values[0]
+        if len(integer_values) >= 2 and integer_values[0] <= 5000 < integer_values[1]:
+            share_candidate = integer_values[1]
+            if not decimal_values:
+                cost_value = float(integer_values[0])
+        shares_value = share_candidate * share_unit_multiplier
+
+    if decimal_values:
+        cost_value = float(decimal_values[0])
+    elif len(integer_values) >= 2 and pd.isna(cost_value):
+        cost_candidates = [value for value in integer_values if 0 < value <= 5000]
+        if cost_candidates:
+            cost_value = float(min(cost_candidates))
+
+    if not name:
+        name = symbol.replace(".TW", "")
+
+    return {
+        "symbol": symbol,
+        "name": name,
+        "shares": shares_value,
+        "cost": cost_value,
+        "category": default_category,
+        "image_name": image_name,
+        "ocr_text": cleaned_line,
+    }
+
+
+def consolidate_ocr_portfolio_df(portfolio_df: pd.DataFrame, default_category: str) -> pd.DataFrame:
+    """合併多張截圖中的重複股票，並保留原始 OCR 文字供人工校對。"""
+    if portfolio_df.empty:
+        return make_empty_ocr_portfolio_df()
+
+    working_df = portfolio_df.copy()
+    working_df["symbol"] = working_df["symbol"].map(normalize_symbol)
+    working_df["shares"] = pd.to_numeric(working_df["shares"], errors="coerce")
+    working_df["cost"] = pd.to_numeric(working_df["cost"], errors="coerce")
+
+    consolidated_rows: list[dict[str, Any]] = []
+    for symbol, group in working_df.groupby("symbol", sort=True, dropna=False):
+        if not symbol:
+            continue
+        consolidated_rows.append(
+            {
+                "symbol": symbol,
+                "name": first_non_empty(group["name"], symbol.replace(".TW", "")),
+                "shares": group["shares"].sum(min_count=1),
+                "cost": first_non_empty(group["cost"], pd.NA),
+                "category": first_non_empty(group["category"], default_category),
+                "image_name": ", ".join(sorted({str(value) for value in group["image_name"] if str(value).strip()})),
+                "ocr_text": " | ".join(str(value) for value in group["ocr_text"] if str(value).strip()),
+            }
+        )
+
+    return pd.DataFrame(consolidated_rows, columns=OCR_PORTFOLIO_COLUMNS)
+
+
+def extract_portfolio_candidates_from_images(
+    uploaded_files: list[Any],
+    default_category: str,
+    share_unit_multiplier: int,
+) -> pd.DataFrame:
+    """對持股截圖執行 OCR，產出可人工確認的持股草稿。"""
+    ocr_engine = get_ocr_engine()
+    parsed_rows: list[dict[str, Any]] = []
+    raw_lines: list[str] = []
+
+    for uploaded_file in uploaded_files:
+        image = Image.open(BytesIO(uploaded_file.getvalue())).convert("RGB")
+        processed_image = ImageOps.autocontrast(ImageOps.grayscale(image))
+        ocr_result, _ = ocr_engine(np.array(processed_image))
+        line_texts = extract_text_lines_from_ocr_result(ocr_result)
+        raw_lines.extend([f"[{uploaded_file.name}] {line}" for line in line_texts])
+
+        for line in line_texts:
+            parsed_row = parse_portfolio_candidate_line(
+                line,
+                default_category=default_category,
+                share_unit_multiplier=share_unit_multiplier,
+                image_name=uploaded_file.name,
+            )
+            if parsed_row:
+                parsed_rows.append(parsed_row)
+
+    portfolio_df = pd.DataFrame(parsed_rows, columns=OCR_PORTFOLIO_COLUMNS)
+    portfolio_df = consolidate_ocr_portfolio_df(portfolio_df, default_category)
+    portfolio_df.attrs["raw_lines"] = raw_lines
+    return portfolio_df
+
+
+def finalize_portfolio_input(portfolio_df: pd.DataFrame, default_category: str = "normal") -> pd.DataFrame:
+    """將 CSV 或 OCR 草稿整理成可供報表計算的標準持股資料表。"""
+    if portfolio_df.empty:
+        return pd.DataFrame(columns=PORTFOLIO_REQUIRED_COLUMNS)
+
+    working_df = portfolio_df.copy()
+    for column in PORTFOLIO_REQUIRED_COLUMNS:
+        if column not in working_df.columns:
+            working_df[column] = pd.NA
+
+    working_df["symbol"] = working_df["symbol"].fillna("").astype(str).str.strip()
+    working_df["name"] = working_df["name"].fillna("").astype(str).str.strip()
+    working_df.loc[working_df["name"] == "", "name"] = working_df.loc[working_df["name"] == "", "symbol"]
+    working_df["shares"] = pd.to_numeric(working_df["shares"], errors="coerce")
+    working_df["cost"] = pd.to_numeric(working_df["cost"], errors="coerce")
+    working_df["category"] = (
+        working_df["category"].fillna(default_category).astype(str).str.strip().replace("", default_category)
+    )
+    working_df = working_df[
+        ~(
+            working_df["symbol"].eq("")
+            & working_df["name"].eq("")
+            & working_df["shares"].isna()
+            & working_df["cost"].isna()
+        )
+    ]
+    return working_df
 
 
 # 3. 載入融資資料，若缺省則回傳空表並由後續流程顯示預設文字。
@@ -908,6 +1181,9 @@ def main() -> None:
         "processing_messages": [],
         "report_excel_bytes": b"",
         "excel_error": "",
+        "ocr_portfolio_df": make_empty_ocr_portfolio_df(),
+        "ocr_raw_lines": [],
+        "ocr_error": "",
     }.items():
         if key not in st.session_state:
             st.session_state[key] = default_value
@@ -920,8 +1196,27 @@ def main() -> None:
     with st.sidebar:
         st.header("資料輸入")
         portfolio_file = st.file_uploader("上傳 portfolio.csv", type=["csv"])
+        portfolio_image_files = st.file_uploader(
+            "上傳持股截圖（可多張）",
+            type=PORTFOLIO_IMAGE_TYPES,
+            accept_multiple_files=True,
+            help="若券商系統無法匯出 CSV，可上傳持股截圖，系統會先做 OCR 草稿，再由你確認後計算。",
+        )
         margin_file = st.file_uploader("上傳 margin.csv（選填）", type=["csv"])
         stop_history_file = st.file_uploader("上傳 stop_history.csv（選填）", type=["csv"])
+
+        st.caption("截圖請盡量裁成持股表格畫面，最好同時包含股票代號、名稱、股數與成本價。")
+        ocr_default_category = st.selectbox(
+            "截圖辨識預設 category",
+            options=list(DEFAULT_ATR_MULTIPLIERS.keys()),
+            index=list(DEFAULT_ATR_MULTIPLIERS.keys()).index("normal"),
+        )
+        share_unit_option = st.selectbox(
+            "截圖中的持股數量單位",
+            options=["股", "張（1張=1000股）"],
+            index=0,
+        )
+        ocr_parse_button = st.button("辨識持股截圖", width="stretch")
 
         st.subheader("參數設定")
         atr_period = st.number_input("ATR 週期", min_value=2, max_value=60, value=14, step=1)
@@ -977,64 +1272,137 @@ def main() -> None:
                 "sidebar",
             )
 
-    if calculate_button:
-        if portfolio_file is None:
-            st.warning("尚未上傳 portfolio.csv，請先上傳持股資料，或先下載 sample CSV 進行修改。")
+    if ocr_parse_button:
+        if not portfolio_image_files:
+            st.warning("尚未上傳持股截圖，請先選擇一張或多張圖片。")
         else:
+            share_unit_multiplier = 1000 if share_unit_option.startswith("張") else 1
+            try:
+                ocr_portfolio_df = extract_portfolio_candidates_from_images(
+                    portfolio_image_files,
+                    default_category=ocr_default_category,
+                    share_unit_multiplier=share_unit_multiplier,
+                )
+                st.session_state["ocr_portfolio_df"] = ocr_portfolio_df
+                st.session_state["ocr_raw_lines"] = ocr_portfolio_df.attrs.get("raw_lines", [])
+                st.session_state["ocr_error"] = ""
+                if ocr_portfolio_df.empty:
+                    st.warning("沒有從截圖辨識到可用的持股資料，請改上傳更清楚的截圖或手動使用 CSV。")
+                else:
+                    st.success("已完成持股截圖辨識，請先在下方草稿表確認與修正資料。")
+            except Exception as exc:
+                st.session_state["ocr_portfolio_df"] = make_empty_ocr_portfolio_df()
+                st.session_state["ocr_raw_lines"] = []
+                st.session_state["ocr_error"] = str(exc)
+                st.error(f"截圖辨識失敗：{exc}")
+
+    ocr_editor_df = None
+    if st.session_state["ocr_error"]:
+        st.error(f"OCR 模組或圖片處理發生問題：{st.session_state['ocr_error']}")
+
+    if not st.session_state["ocr_portfolio_df"].empty:
+        st.subheader("截圖辨識持股草稿")
+        st.caption("請確認股票代號、股數、成本價與 category；若辨識不完整，可直接在下方表格手動修正後再按開始計算。")
+        ocr_editor_df = st.data_editor(
+            st.session_state["ocr_portfolio_df"],
+            width="stretch",
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "symbol": st.column_config.TextColumn("股票代號"),
+                "name": st.column_config.TextColumn("股票名稱"),
+                "shares": st.column_config.NumberColumn("股數", step=1, format="%.0f"),
+                "cost": st.column_config.NumberColumn("成本價", step=0.01, format="%.2f"),
+                "category": st.column_config.SelectboxColumn(
+                    "category",
+                    options=list(DEFAULT_ATR_MULTIPLIERS.keys()),
+                    default=ocr_default_category,
+                ),
+                "image_name": st.column_config.TextColumn("來源截圖", disabled=True),
+                "ocr_text": st.column_config.TextColumn("原始辨識文字", disabled=True),
+            },
+            key="ocr-portfolio-editor",
+        )
+
+        if st.session_state["ocr_raw_lines"]:
+            with st.expander("查看 OCR 原始辨識文字"):
+                for raw_line in st.session_state["ocr_raw_lines"]:
+                    st.write(f"- {raw_line}")
+
+    if calculate_button:
+        portfolio_df = pd.DataFrame()
+        portfolio_source = "csv"
+
+        if portfolio_file is not None:
             try:
                 portfolio_df = load_uploaded_csv(portfolio_file)
             except ValueError as exc:
                 st.error(f"portfolio.csv 讀取失敗：{exc}")
                 portfolio_df = pd.DataFrame()
 
+            portfolio_df = finalize_portfolio_input(portfolio_df)
             missing_columns = validate_required_columns(portfolio_df, PORTFOLIO_REQUIRED_COLUMNS)
             if missing_columns:
                 st.error(f"portfolio.csv 缺少必要欄位：{', '.join(missing_columns)}")
-            elif portfolio_df.empty:
-                st.error("portfolio.csv 內容為空，請確認檔案後重新上傳。")
-            else:
-                margin_df = load_margin_data(margin_file)
-                stop_history_df = load_stop_history(stop_history_file)
+                portfolio_df = pd.DataFrame()
+        elif ocr_editor_df is not None:
+            portfolio_source = "ocr"
+            portfolio_df = finalize_portfolio_input(ocr_editor_df, default_category=ocr_default_category)
+            incomplete_ocr_df = portfolio_df[
+                portfolio_df["symbol"].eq("") | portfolio_df["shares"].isna() | portfolio_df["cost"].isna()
+            ]
+            if not incomplete_ocr_df.empty:
+                st.error("截圖辨識後仍有缺少股票代號、股數或成本價的列，請先在草稿表補齊再計算。")
+                portfolio_df = pd.DataFrame()
+        else:
+            st.warning("請上傳 portfolio.csv，或先上傳持股截圖並按『辨識持股截圖』產生草稿。")
 
-                if margin_df.attrs.get("validation_error"):
-                    st.warning(f"margin.csv 讀取失敗，將略過融資分析：{margin_df.attrs['validation_error']}")
-                if margin_df.attrs.get("missing_columns"):
-                    st.warning(
-                        "margin.csv 缺少欄位，將略過融資分析："
-                        + ", ".join(margin_df.attrs["missing_columns"])
-                    )
+        if not portfolio_df.empty:
+            margin_df = load_margin_data(margin_file)
+            stop_history_df = load_stop_history(stop_history_file)
 
-                if stop_history_df.attrs.get("validation_error"):
-                    st.warning(f"stop_history.csv 讀取失敗，將從空白歷史開始：{stop_history_df.attrs['validation_error']}")
-                if stop_history_df.attrs.get("missing_columns"):
-                    st.warning(
-                        "stop_history.csv 缺少欄位，將從空白歷史開始："
-                        + ", ".join(stop_history_df.attrs["missing_columns"])
-                    )
+            if portfolio_source == "ocr":
+                st.info("本次使用截圖辨識後的持股草稿進行計算。")
 
-                settings = {
-                    "atr_period": int(atr_period),
-                    "high_period": int(high_period),
-                    "multiplier_settings": multiplier_settings,
-                }
+            if margin_df.attrs.get("validation_error"):
+                st.warning(f"margin.csv 讀取失敗，將略過融資分析：{margin_df.attrs['validation_error']}")
+            if margin_df.attrs.get("missing_columns"):
+                st.warning(
+                    "margin.csv 缺少欄位，將略過融資分析："
+                    + ", ".join(margin_df.attrs["missing_columns"])
+                )
 
-                with st.spinner("正在下載股價、計算 ATR 與整理報表..."):
-                    report_df = build_report(portfolio_df, margin_df, stop_history_df, settings)
-                    updated_stop_history_df = build_updated_stop_history(report_df, stop_history_df)
+            if stop_history_df.attrs.get("validation_error"):
+                st.warning(f"stop_history.csv 讀取失敗，將從空白歷史開始：{stop_history_df.attrs['validation_error']}")
+            if stop_history_df.attrs.get("missing_columns"):
+                st.warning(
+                    "stop_history.csv 缺少欄位，將從空白歷史開始："
+                    + ", ".join(stop_history_df.attrs["missing_columns"])
+                )
 
-                st.session_state["report_df"] = report_df
-                st.session_state["updated_stop_history_df"] = updated_stop_history_df
-                st.session_state["processing_messages"] = report_df.attrs.get("processing_messages", [])
+            settings = {
+                "atr_period": int(atr_period),
+                "high_period": int(high_period),
+                "multiplier_settings": multiplier_settings,
+            }
 
-                try:
-                    st.session_state["report_excel_bytes"] = create_excel_bytes(report_df)
-                    st.session_state["excel_error"] = ""
-                except Exception as exc:
-                    st.session_state["report_excel_bytes"] = b""
-                    st.session_state["excel_error"] = str(exc)
+            with st.spinner("正在下載股價、計算 ATR 與整理報表..."):
+                report_df = build_report(portfolio_df, margin_df, stop_history_df, settings)
+                updated_stop_history_df = build_updated_stop_history(report_df, stop_history_df)
 
-    if portfolio_file is None and st.session_state["report_df"].empty:
-        st.info("請先上傳 portfolio.csv，系統才會開始計算 ATR、移動停利與融資風險。")
+            st.session_state["report_df"] = report_df
+            st.session_state["updated_stop_history_df"] = updated_stop_history_df
+            st.session_state["processing_messages"] = report_df.attrs.get("processing_messages", [])
+
+            try:
+                st.session_state["report_excel_bytes"] = create_excel_bytes(report_df)
+                st.session_state["excel_error"] = ""
+            except Exception as exc:
+                st.session_state["report_excel_bytes"] = b""
+                st.session_state["excel_error"] = str(exc)
+
+    if portfolio_file is None and st.session_state["ocr_portfolio_df"].empty and st.session_state["report_df"].empty:
+        st.info("請先上傳 portfolio.csv，或改上傳持股截圖進行 OCR 辨識，系統才會開始計算 ATR、移動停利與融資風險。")
         st.download_button(
             "下載 portfolio_sample.csv",
             data=sample_portfolio_bytes,
