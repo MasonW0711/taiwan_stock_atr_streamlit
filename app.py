@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from io import BytesIO
+import json
 from pathlib import Path
 import re
 from typing import Any
 import unicodedata
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -121,6 +124,12 @@ DISPLAY_NUMBER_COLUMNS = [
 
 RISK_DOWNLOAD_FAILURE = "資料下載失敗，暫不判斷"
 RISK_DATA_INSUFFICIENT = "資料不足，暫不判斷"
+OFFICIAL_MARGIN_LOOKBACK_DAYS = 10
+OFFICIAL_DATA_TIMEOUT_SECONDS = 15
+OFFICIAL_DATA_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+)
 
 
 def format_ocr_error_message(error: Exception) -> str:
@@ -216,6 +225,262 @@ def load_local_csv_bytes(file_path: Path) -> bytes:
     return pd.read_csv(file_path).to_csv(index=False).encode("utf-8-sig")
 
 
+def parse_official_number(value: Any) -> float:
+    """把官方 JSON 內帶千分位或百分號的數字字串轉成浮點數。"""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not text:
+        return float("nan")
+
+    normalized = re.sub(r"\s+", "", text)
+    normalized = normalized.replace(",", "").replace("%", "")
+    normalized = normalized.replace("＋", "+").replace("－", "-")
+    if normalized in {"", "-", "--", "---"}:
+        return float("nan")
+
+    result = pd.to_numeric(pd.Series([normalized]), errors="coerce").iloc[0]
+    return float(result) if pd.notna(result) else float("nan")
+
+
+def format_roc_date(target_date: date) -> str:
+    """把西元日期轉成櫃買中心端點需要的民國日期字串。"""
+    return f"{target_date.year - 1911}/{target_date.month:02d}/{target_date.day:02d}"
+
+
+def fetch_json_from_url(url: str) -> dict[str, Any]:
+    """以瀏覽器樣式 User-Agent 下載官方 JSON。"""
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json,text/plain,*/*",
+            "User-Agent": OFFICIAL_DATA_USER_AGENT,
+        },
+    )
+    with urlopen(request, timeout=OFFICIAL_DATA_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def build_twse_margin_url(target_date: date) -> str:
+    """建立證交所融資融券彙總 JSON 端點。"""
+    query = urlencode(
+        {
+            "date": target_date.strftime("%Y%m%d"),
+            "selectType": "ALL",
+            "response": "json",
+        }
+    )
+    return f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?{query}"
+
+
+def build_tpex_margin_url(target_date: date) -> str:
+    """建立櫃買中心融資融券餘額 JSON 端點。"""
+    query = urlencode(
+        {
+            "l": "zh-tw",
+            "o": "json",
+            "d": format_roc_date(target_date),
+            "s": "0,asc,0",
+        }
+    )
+    return f"https://www.tpex.org.tw/web/stock/margin_trading/margin_balance/margin_bal_result.php?{query}"
+
+
+def build_official_margin_row(
+    symbol: str,
+    record_date: str,
+    current_balance: Any,
+    previous_balance: Any,
+) -> dict[str, Any]:
+    """把官方欄位整理成系統既有的 margin.csv 結構。"""
+    current_value = parse_official_number(current_balance)
+    previous_value = parse_official_number(previous_balance)
+
+    if pd.notna(current_value) and pd.notna(previous_value):
+        margin_change = current_value - previous_value
+    else:
+        margin_change = float("nan")
+
+    if pd.notna(margin_change) and pd.notna(previous_value) and previous_value != 0:
+        margin_change_rate = (margin_change / previous_value) * 100
+    else:
+        margin_change_rate = float("nan")
+
+    return {
+        "symbol": symbol,
+        "date": record_date,
+        "margin_balance": current_value,
+        "margin_change": margin_change,
+        "margin_change_rate": margin_change_rate,
+        "foreign_buy_sell": float("nan"),
+        "investment_trust_buy_sell": float("nan"),
+        "price_change_rate": float("nan"),
+    }
+
+
+def parse_twse_margin_payload(payload: dict[str, Any]) -> tuple[pd.DataFrame, str]:
+    """解析證交所融資融券彙總資料。"""
+    status_text = str(payload.get("stat", "")).strip()
+    if status_text != "OK":
+        raise ValueError(status_text or "證交所端點未回傳有效資料")
+
+    record_date = pd.to_datetime(payload.get("date"), format="%Y%m%d", errors="coerce")
+    if pd.isna(record_date):
+        raise ValueError("證交所資料缺少有效日期")
+
+    detail_table = None
+    for table in payload.get("tables", []):
+        fields = table.get("fields") or []
+        if fields and fields[0] == "代號" and "前日餘額" in fields and "今日餘額" in fields:
+            detail_table = table
+            break
+
+    if detail_table is None or not detail_table.get("data"):
+        raise ValueError("證交所該日無融資融券明細")
+
+    fields = detail_table.get("fields") or []
+    previous_balance_index = fields.index("前日餘額")
+    current_balance_index = fields.index("今日餘額")
+    normalized_date = record_date.strftime("%Y-%m-%d")
+
+    rows: list[dict[str, Any]] = []
+    for item in detail_table.get("data", []):
+        if len(item) <= current_balance_index:
+            continue
+
+        stock_code = str(item[0]).strip().upper()
+        if not stock_code:
+            continue
+
+        rows.append(
+            build_official_margin_row(
+                symbol=f"{stock_code}.TW",
+                record_date=normalized_date,
+                current_balance=item[current_balance_index],
+                previous_balance=item[previous_balance_index],
+            )
+        )
+
+    if not rows:
+        raise ValueError("證交所該日無可用融資餘額")
+
+    return pd.DataFrame(rows, columns=MARGIN_REQUIRED_COLUMNS), normalized_date
+
+
+def parse_tpex_margin_payload(payload: dict[str, Any]) -> tuple[pd.DataFrame, str]:
+    """解析櫃買中心融資融券餘額資料。"""
+    status_text = str(payload.get("stat", "")).strip().lower()
+    if status_text != "ok":
+        raise ValueError(str(payload.get("stat", "")).strip() or "櫃買中心端點未回傳有效資料")
+
+    record_date = pd.to_datetime(payload.get("date"), format="%Y%m%d", errors="coerce")
+    if pd.isna(record_date):
+        raise ValueError("櫃買中心資料缺少有效日期")
+
+    tables = payload.get("tables") or []
+    if not tables:
+        raise ValueError("櫃買中心該日無融資融券明細")
+
+    detail_table = tables[0]
+    if not detail_table.get("data"):
+        raise ValueError("櫃買中心該日無融資融券明細")
+
+    fields = detail_table.get("fields") or []
+    previous_balance_index = fields.index("前資餘額(張)")
+    current_balance_index = fields.index("資餘額")
+    normalized_date = record_date.strftime("%Y-%m-%d")
+
+    rows: list[dict[str, Any]] = []
+    for item in detail_table.get("data", []):
+        if len(item) <= current_balance_index:
+            continue
+
+        stock_code = str(item[0]).strip().upper()
+        if not stock_code:
+            continue
+
+        rows.append(
+            build_official_margin_row(
+                symbol=f"{stock_code}.TWO",
+                record_date=normalized_date,
+                current_balance=item[current_balance_index],
+                previous_balance=item[previous_balance_index],
+            )
+        )
+
+    if not rows:
+        raise ValueError("櫃買中心該日無可用融資餘額")
+
+    return pd.DataFrame(rows, columns=MARGIN_REQUIRED_COLUMNS), normalized_date
+
+
+def fetch_market_margin_data(
+    market_label: str,
+    reference_date: date,
+    url_builder: Any,
+    payload_parser: Any,
+) -> dict[str, Any]:
+    """往前回退到最近可用交易日，抓取單一市場的官方融資資料。"""
+    recent_errors: list[str] = []
+
+    for offset in range(OFFICIAL_MARGIN_LOOKBACK_DAYS + 1):
+        target_date = reference_date - timedelta(days=offset)
+        try:
+            payload = fetch_json_from_url(url_builder(target_date))
+            margin_df, used_date = payload_parser(payload)
+            if not margin_df.empty:
+                return {"data": margin_df, "used_date": used_date, "warning": ""}
+        except Exception as exc:
+            recent_errors.append(f"{target_date.isoformat()}：{exc}")
+
+    summarized_errors = "；".join(recent_errors[-3:]) if recent_errors else "無額外錯誤訊息"
+    return {
+        "data": make_empty_margin_df(),
+        "used_date": None,
+        "warning": f"{market_label} 最近 {OFFICIAL_MARGIN_LOOKBACK_DAYS + 1} 天查無可用官方融資資料：{summarized_errors}",
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_official_margin_data(reference_date_text: str | None = None) -> dict[str, Any]:
+    """自動抓取證交所與櫃買中心最近可用的官方融資資料。"""
+    reference_timestamp = pd.to_datetime(reference_date_text or date.today().isoformat(), errors="coerce")
+    reference_day = reference_timestamp.date() if pd.notna(reference_timestamp) else date.today()
+
+    market_configs = [
+        ("上市", build_twse_margin_url, parse_twse_margin_payload),
+        ("上櫃", build_tpex_margin_url, parse_tpex_margin_payload),
+    ]
+
+    frames: list[pd.DataFrame] = []
+    source_parts: list[str] = []
+    warnings: list[str] = []
+
+    for market_label, url_builder, payload_parser in market_configs:
+        market_result = fetch_market_margin_data(market_label, reference_day, url_builder, payload_parser)
+        market_df = market_result["data"]
+        if not market_df.empty:
+            frames.append(market_df)
+            if market_result["used_date"]:
+                source_parts.append(f"{market_label} {market_result['used_date']}")
+        elif market_result["warning"]:
+            warnings.append(market_result["warning"])
+
+    combined_df = pd.concat(frames, ignore_index=True) if frames else make_empty_margin_df()
+    source_summary = "已自動抓取官方融資資料：" + "、".join(source_parts) if source_parts else ""
+
+    fetch_error = ""
+    if combined_df.empty:
+        fetch_error = "目前無法自動取得官方融資資料。"
+        if warnings:
+            fetch_error = fetch_error + " " + "；".join(warnings)
+
+    return {
+        "data": combined_df,
+        "source_summary": source_summary,
+        "warnings": warnings,
+        "fetch_error": fetch_error,
+    }
+
+
 def is_stop_broken(current_price: Any, final_trailing_stop: Any) -> bool:
     """判斷目前股價是否已跌破最終 ATR 移動停利價。"""
     current = to_float(current_price)
@@ -228,6 +493,55 @@ def is_elevated_margin_risk(risk_text: Any) -> bool:
     text = str(risk_text or "")
     keywords = ["風險升高", "惡化", "過熱", "提高移動停利紀律"]
     return any(keyword in text for keyword in keywords)
+
+
+def determine_margin_risk_text(
+    margin_change_rate: Any,
+    foreign_buy_sell: Any,
+    investment_trust_buy_sell: Any,
+    price_change_rate: Any,
+) -> str:
+    """依融資增減、法人籌碼與股價漲跌幅回傳融資風險文字。"""
+    margin_change_rate_value = to_float(margin_change_rate)
+    foreign_buy_sell_value = to_float(foreign_buy_sell)
+    investment_trust_buy_sell_value = to_float(investment_trust_buy_sell)
+    price_change_rate_value = to_float(price_change_rate)
+
+    risk_text = "融資變化中性，持續追蹤"
+    if (
+        pd.notna(foreign_buy_sell_value)
+        and pd.notna(investment_trust_buy_sell_value)
+        and pd.notna(margin_change_rate_value)
+        and foreign_buy_sell_value < 0
+        and investment_trust_buy_sell_value < 0
+        and margin_change_rate_value > 0
+    ):
+        risk_text = "法人賣超但融資增加，散戶接籌碼風險升高"
+    elif (
+        pd.notna(margin_change_rate_value)
+        and pd.notna(price_change_rate_value)
+        and margin_change_rate_value > 5
+        and price_change_rate_value < 0
+    ):
+        risk_text = "融資增加但股價下跌，籌碼惡化"
+    elif (
+        pd.notna(margin_change_rate_value)
+        and pd.notna(price_change_rate_value)
+        and margin_change_rate_value > 10
+        and price_change_rate_value <= 3
+    ):
+        risk_text = "融資大增但股價漲幅有限，短線過熱"
+    elif (
+        pd.notna(margin_change_rate_value)
+        and pd.notna(price_change_rate_value)
+        and margin_change_rate_value > 10
+        and price_change_rate_value > 5
+    ):
+        risk_text = "融資大增且股價強漲，續抱但需提高移動停利紀律"
+    elif pd.notna(margin_change_rate_value) and margin_change_rate_value <= 0:
+        risk_text = "融資未增加，籌碼壓力較低"
+
+    return risk_text
 
 
 def determine_risk_and_action(current_price: Any, final_trailing_stop: Any, cost: Any) -> tuple[str, str]:
@@ -543,22 +857,30 @@ def finalize_portfolio_input(portfolio_df: pd.DataFrame, default_category: str =
     return working_df
 
 
-# 3. 載入融資資料，若缺省則回傳空表並由後續流程顯示預設文字。
-def load_margin_data(uploaded_file: Any) -> pd.DataFrame:
-    """載入使用者上傳的融資資料並完成欄位與型別清理。"""
+# 3. 載入融資資料；若未上傳則改抓證交所與櫃買中心官方資料。
+def load_margin_data(uploaded_file: Any, reference_date: date | None = None) -> pd.DataFrame:
+    """載入使用者上傳的融資資料，或自動抓取官方融資資料。"""
     if uploaded_file is None:
-        return make_empty_margin_df()
+        official_result = download_official_margin_data((reference_date or date.today()).isoformat())
+        margin_df = official_result["data"].copy()
+        margin_df.attrs["source"] = "official"
+        margin_df.attrs["source_summary"] = official_result.get("source_summary", "")
+        margin_df.attrs["fetch_warnings"] = official_result.get("warnings", [])
+        margin_df.attrs["fetch_error"] = official_result.get("fetch_error", "")
+        return margin_df
 
     try:
         margin_df = load_uploaded_csv(uploaded_file)
     except ValueError as exc:
         margin_df = make_empty_margin_df()
+        margin_df.attrs["source"] = "upload"
         margin_df.attrs["validation_error"] = str(exc)
         return margin_df
 
     missing_columns = validate_required_columns(margin_df, MARGIN_REQUIRED_COLUMNS)
     if missing_columns:
         empty_df = make_empty_margin_df()
+        empty_df.attrs["source"] = "upload"
         empty_df.attrs["missing_columns"] = missing_columns
         return empty_df
 
@@ -578,6 +900,7 @@ def load_margin_data(uploaded_file: Any) -> pd.DataFrame:
 
     margin_df = margin_df.dropna(subset=["symbol"])
     margin_df["date"] = margin_df["date"].dt.strftime("%Y-%m-%d")
+    margin_df.attrs["source"] = "upload"
     return margin_df
 
 
@@ -688,6 +1011,19 @@ def calculate_atr(stock_df: pd.DataFrame, atr_period: int) -> pd.DataFrame:
     return atr_df
 
 
+def calculate_daily_price_change_rate(stock_df: pd.DataFrame) -> float:
+    """使用最近兩個交易日收盤價計算單日漲跌幅。"""
+    if stock_df.empty or "Close" not in stock_df.columns or len(stock_df) < 2:
+        return float("nan")
+
+    latest_close = to_float(stock_df["Close"].iloc[-1])
+    previous_close = to_float(stock_df["Close"].iloc[-2])
+    if pd.isna(latest_close) or pd.isna(previous_close) or previous_close == 0:
+        return float("nan")
+
+    return ((latest_close - previous_close) / previous_close) * 100
+
+
 # 7. 依照持股類型回傳 ATR 倍數，並允許使用者用側邊欄手動覆寫。
 def get_atr_multiplier(category: Any, multiplier_settings: dict[str, float]) -> float:
     """根據持股類型決定 ATR 倍數；找不到時回傳預設值 2.0。"""
@@ -788,29 +1124,12 @@ def calculate_margin_risk(symbol: str, margin_df: pd.DataFrame) -> dict[str, Any
     matched = matched.sort_values("date")
     row = matched.iloc[-1]
 
-    margin_change_rate = to_float(row.get("margin_change_rate"))
-    foreign_buy_sell = to_float(row.get("foreign_buy_sell"))
-    investment_trust_buy_sell = to_float(row.get("investment_trust_buy_sell"))
-    price_change_rate = to_float(row.get("price_change_rate"))
-
-    risk_text = "融資變化中性，持續追蹤"
-    if (
-        pd.notna(foreign_buy_sell)
-        and pd.notna(investment_trust_buy_sell)
-        and pd.notna(margin_change_rate)
-        and foreign_buy_sell < 0
-        and investment_trust_buy_sell < 0
-        and margin_change_rate > 0
-    ):
-        risk_text = "法人賣超但融資增加，散戶接籌碼風險升高"
-    elif pd.notna(margin_change_rate) and pd.notna(price_change_rate) and margin_change_rate > 5 and price_change_rate < 0:
-        risk_text = "融資增加但股價下跌，籌碼惡化"
-    elif pd.notna(margin_change_rate) and pd.notna(price_change_rate) and margin_change_rate > 10 and price_change_rate <= 3:
-        risk_text = "融資大增但股價漲幅有限，短線過熱"
-    elif pd.notna(margin_change_rate) and pd.notna(price_change_rate) and margin_change_rate > 10 and price_change_rate > 5:
-        risk_text = "融資大增且股價強漲，續抱但需提高移動停利紀律"
-    elif pd.notna(margin_change_rate) and margin_change_rate <= 0:
-        risk_text = "融資未增加，籌碼壓力較低"
+    risk_text = determine_margin_risk_text(
+        row.get("margin_change_rate"),
+        row.get("foreign_buy_sell"),
+        row.get("investment_trust_buy_sell"),
+        row.get("price_change_rate"),
+    )
 
     result.update(
         {
@@ -916,6 +1235,19 @@ def build_report(
                 "資料更新日期": stock_df.index[-1].strftime("%Y-%m-%d"),
             }
         )
+
+        if pd.isna(to_float(report_row["股價漲跌幅"])):
+            computed_price_change_rate = calculate_daily_price_change_rate(stock_df)
+            if pd.notna(computed_price_change_rate):
+                report_row["股價漲跌幅"] = computed_price_change_rate
+
+        if pd.notna(to_float(report_row["融資餘額"])):
+            report_row["融資風險"] = determine_margin_risk_text(
+                report_row["融資增減率"],
+                report_row["外資買賣超"],
+                report_row["投信買賣超"],
+                report_row["股價漲跌幅"],
+            )
 
         atr_df = calculate_atr(stock_df, settings["atr_period"])
         trailing_stop_result = calculate_trailing_stop(atr_df, atr_multiplier, settings["high_period"])
@@ -1293,7 +1625,7 @@ def main() -> None:
             accept_multiple_files=True,
             help="若券商系統無法匯出 CSV，可上傳持股截圖，系統會先做 OCR 草稿，再由你確認後計算。",
         )
-        margin_file = st.file_uploader("上傳 margin.csv（選填）", type=["csv"])
+        margin_file = st.file_uploader("上傳 margin.csv（選填，可覆蓋官方融資資料）", type=["csv"])
         stop_history_file = st.file_uploader("上傳 stop_history.csv（選填）", type=["csv"])
 
         st.caption("截圖請盡量裁成持股表格畫面，最好同時包含股票代號、名稱、股數與成本價。")
@@ -1449,7 +1781,7 @@ def main() -> None:
             st.warning("請上傳 portfolio.csv，或先上傳持股截圖並按『辨識持股截圖』產生草稿。")
 
         if not portfolio_df.empty:
-            margin_df = load_margin_data(margin_file)
+            margin_df = load_margin_data(margin_file, reference_date=date.today())
             stop_history_df = load_stop_history(stop_history_file)
 
             if portfolio_source == "ocr":
@@ -1462,6 +1794,13 @@ def main() -> None:
                     "margin.csv 缺少欄位，將略過融資分析："
                     + ", ".join(margin_df.attrs["missing_columns"])
                 )
+            if margin_df.attrs.get("source") == "official":
+                if margin_df.attrs.get("source_summary"):
+                    st.info(margin_df.attrs["source_summary"])
+                if margin_df.attrs.get("fetch_warnings") and not margin_df.attrs.get("fetch_error"):
+                    st.warning("部分官方融資資料未取得：" + "；".join(margin_df.attrs["fetch_warnings"]))
+                if margin_df.attrs.get("fetch_error"):
+                    st.warning(f"官方融資資料自動抓取失敗：{margin_df.attrs['fetch_error']}")
 
             if stop_history_df.attrs.get("validation_error"):
                 st.warning(f"stop_history.csv 讀取失敗，將從空白歷史開始：{stop_history_df.attrs['validation_error']}")
