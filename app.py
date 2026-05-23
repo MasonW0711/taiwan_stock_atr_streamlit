@@ -5,9 +5,10 @@ from io import BytesIO
 import json
 from pathlib import Path
 import re
+import ssl
 from typing import Any
 import unicodedata
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -126,6 +127,8 @@ RISK_DOWNLOAD_FAILURE = "資料下載失敗，暫不判斷"
 RISK_DATA_INSUFFICIENT = "資料不足，暫不判斷"
 OFFICIAL_MARGIN_LOOKBACK_DAYS = 10
 OFFICIAL_DATA_TIMEOUT_SECONDS = 15
+OFFICIAL_DATA_RETRY_ATTEMPTS = 2
+OFFICIAL_MARGIN_CACHE_TTL_SECONDS = 300
 OFFICIAL_DATA_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
@@ -246,6 +249,51 @@ def format_roc_date(target_date: date) -> str:
     return f"{target_date.year - 1911}/{target_date.month:02d}/{target_date.day:02d}"
 
 
+def build_official_ssl_context_candidates(url: str) -> list[ssl.SSLContext | None]:
+    """為官方 JSON 端點建立可接受的 SSL context 候選清單。"""
+    contexts: list[ssl.SSLContext | None] = [None]
+    hostname = (urlparse(url).hostname or "").lower()
+
+    # TPEX 偶爾會回傳讓部分 OpenSSL 組合驗證失敗的憑證鏈，
+    # 這裡只對官方唯讀公開端點做有限 fallback，避免整批上櫃資料直接缺失。
+    if hostname != "www.tpex.org.tw":
+        return contexts
+
+    try:
+        import certifi
+
+        contexts.append(ssl.create_default_context(cafile=certifi.where()))
+    except Exception:
+        pass
+
+    contexts.append(ssl._create_unverified_context())
+    return contexts
+
+
+def fetch_url_bytes(url: str, request: Request) -> bytes:
+    """下載官方端點內容，必要時重試並切換 SSL 驗證策略。"""
+    recent_errors: list[str] = []
+
+    for _ in range(OFFICIAL_DATA_RETRY_ATTEMPTS):
+        for ssl_context in build_official_ssl_context_candidates(url):
+            try:
+                open_kwargs: dict[str, Any] = {"timeout": OFFICIAL_DATA_TIMEOUT_SECONDS}
+                if ssl_context is not None:
+                    open_kwargs["context"] = ssl_context
+                with urlopen(request, **open_kwargs) as response:
+                    return response.read()
+            except Exception as exc:
+                recent_errors.append(str(exc))
+
+    summarized_errors: list[str] = []
+    for message in recent_errors:
+        if message not in summarized_errors:
+            summarized_errors.append(message)
+
+    error_text = "；".join(summarized_errors[-3:]) if summarized_errors else "未知錯誤"
+    raise RuntimeError(f"下載官方資料失敗：{error_text}")
+
+
 def fetch_json_from_url(url: str) -> dict[str, Any]:
     """以瀏覽器樣式 User-Agent 下載官方 JSON。"""
     request = Request(
@@ -255,8 +303,7 @@ def fetch_json_from_url(url: str) -> dict[str, Any]:
             "User-Agent": OFFICIAL_DATA_USER_AGENT,
         },
     )
-    with urlopen(request, timeout=OFFICIAL_DATA_TIMEOUT_SECONDS) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return json.loads(fetch_url_bytes(url, request).decode("utf-8"))
 
 
 def build_twse_margin_url(target_date: date) -> str:
@@ -439,8 +486,7 @@ def fetch_market_margin_data(
     }
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def download_official_margin_data(reference_date_text: str | None = None) -> dict[str, Any]:
+def download_official_margin_data_impl(reference_date_text: str | None = None) -> dict[str, Any]:
     """自動抓取證交所與櫃買中心最近可用的官方融資資料。"""
     reference_timestamp = pd.to_datetime(reference_date_text or date.today().isoformat(), errors="coerce")
     reference_day = reference_timestamp.date() if pd.notna(reference_timestamp) else date.today()
@@ -479,6 +525,43 @@ def download_official_margin_data(reference_date_text: str | None = None) -> dic
         "warnings": warnings,
         "fetch_error": fetch_error,
     }
+
+
+@st.cache_data(ttl=OFFICIAL_MARGIN_CACHE_TTL_SECONDS, show_spinner=False)
+def download_official_margin_data_cached(reference_date_text: str | None = None) -> dict[str, Any]:
+    """快取官方融資資料，減少重複請求。"""
+    return download_official_margin_data_impl(reference_date_text)
+
+
+def should_replace_official_margin_result(cached_result: dict[str, Any], live_result: dict[str, Any]) -> bool:
+    """比較快取與即時抓取結果，判斷是否應以即時結果覆蓋。"""
+    cached_rows = len(cached_result.get("data", make_empty_margin_df()))
+    live_rows = len(live_result.get("data", make_empty_margin_df()))
+    cached_warning_count = len(cached_result.get("warnings", []))
+    live_warning_count = len(live_result.get("warnings", []))
+
+    if live_rows > cached_rows:
+        return True
+    if live_warning_count < cached_warning_count:
+        return True
+    if bool(cached_result.get("fetch_error")) and not live_result.get("fetch_error"):
+        return True
+    if not cached_result.get("source_summary") and live_result.get("source_summary"):
+        return True
+    return False
+
+
+def download_official_margin_data(reference_date_text: str | None = None) -> dict[str, Any]:
+    """取得官方融資資料；若快取只有部分市場成功，會再做一次即時重試。"""
+    cached_result = download_official_margin_data_cached(reference_date_text)
+    if not cached_result.get("warnings"):
+        return cached_result
+
+    live_result = download_official_margin_data_impl(reference_date_text)
+    if should_replace_official_margin_result(cached_result, live_result):
+        download_official_margin_data_cached.clear()
+        return live_result
+    return cached_result
 
 
 def is_stop_broken(current_price: Any, final_trailing_stop: Any) -> bool:
