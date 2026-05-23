@@ -1061,16 +1061,24 @@ def parse_portfolio_candidate_line(
     tokenized_parts = [part for part in re.split(r"\s+", trailing_text) if part]
     name_tokens: list[str] = []
     numeric_tokens: list[str] = []
+    break_even_decimal_values: list[float] = []
+    profit_rate_seen = False
 
     for part in tokenized_parts:
         normalized_part = part.replace(",", "").rstrip("%")
         is_numeric_token = bool(re.fullmatch(r"-?\d+(?:\.\d+)?", normalized_part))
+
+        if "%" in part:
+            profit_rate_seen = True
 
         if part not in OCR_NON_NAME_TOKENS and not is_numeric_token and not leading_name:
             name_tokens.append(part)
 
         if is_numeric_token and not normalized_part.startswith("-"):
             numeric_tokens.append(normalized_part)
+            # 券商持股摘要常把損益平衡價放在報酬率後面，優先採用該值作為成本基準。
+            if profit_rate_seen and "." in normalized_part:
+                break_even_decimal_values.append(float(normalized_part))
 
         if part in OCR_NON_NAME_TOKENS:
             continue
@@ -1102,7 +1110,9 @@ def parse_portfolio_candidate_line(
                 cost_value = float(integer_values[0])
         shares_value = share_candidate * share_unit_multiplier
 
-    if decimal_values:
+    if break_even_decimal_values:
+        cost_value = float(break_even_decimal_values[-1])
+    elif decimal_values:
         cost_value = float(decimal_values[0])
     elif len(integer_values) >= 2 and pd.isna(cost_value):
         cost_candidates = [value for value in integer_values if 0 < value <= 5000]
@@ -2003,7 +2013,7 @@ def main() -> None:
         margin_file = st.file_uploader("上傳 margin.csv（選填，可覆蓋官方融資／法人資料）", type=["csv"])
         stop_history_file = st.file_uploader("上傳 stop_history.csv（選填）", type=["csv"])
 
-        st.caption("截圖請盡量裁成持股表格畫面，最好同時包含股票代號、名稱、股數與成本價。")
+        st.caption("截圖請盡量裁成持股表格畫面，最好同時包含股票代號、名稱、股數與損益平衡價；若沒有，再使用成本價。")
         ocr_default_category = st.selectbox(
             "截圖辨識預設 category",
             options=list(DEFAULT_ATR_MULTIPLIERS.keys()),
@@ -2100,7 +2110,7 @@ def main() -> None:
 
     if not st.session_state["ocr_portfolio_df"].empty:
         st.subheader("截圖辨識持股草稿")
-        st.caption("請確認股票代號、股數、成本價與 category；若辨識不完整，可直接在下方表格手動修正後再按開始計算。")
+        st.caption("請確認股票代號、股數、成本價與 category；系統會優先抓損益平衡價，若來源沒有才退回成本價。")
         ocr_editor_df = st.data_editor(
             st.session_state["ocr_portfolio_df"],
             width="stretch",
