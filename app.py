@@ -113,6 +113,21 @@ RISK_DOWNLOAD_FAILURE = "資料下載失敗，暫不判斷"
 RISK_DATA_INSUFFICIENT = "資料不足，暫不判斷"
 
 
+def format_ocr_error_message(error: Exception) -> str:
+    """將常見 OCR 載入錯誤轉成較可操作的提示。"""
+    message = str(error)
+    lowered = message.lower()
+
+    if "libgl.so.1" in lowered:
+        return (
+            "部署環境缺少 libGL 系統套件，導致 OCR 模組無法載入。"
+            "若部署在 Streamlit Community Cloud，請確認專案根目錄有 packages.txt，"
+            "並讓平台重新部署以安裝 libgl1、libglib2.0-0 等系統套件。"
+        )
+
+    return message
+
+
 def make_empty_margin_df() -> pd.DataFrame:
     """建立空白融資資料表，方便缺省情境直接沿用。"""
     return pd.DataFrame(columns=MARGIN_REQUIRED_COLUMNS)
@@ -1293,8 +1308,8 @@ def main() -> None:
             except Exception as exc:
                 st.session_state["ocr_portfolio_df"] = make_empty_ocr_portfolio_df()
                 st.session_state["ocr_raw_lines"] = []
-                st.session_state["ocr_error"] = str(exc)
-                st.error(f"截圖辨識失敗：{exc}")
+                st.session_state["ocr_error"] = format_ocr_error_message(exc)
+                st.error(f"截圖辨識失敗：{st.session_state['ocr_error']}")
 
     ocr_editor_df = None
     if st.session_state["ocr_error"]:
