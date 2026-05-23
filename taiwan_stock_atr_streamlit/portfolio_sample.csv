@@ -1,0 +1,12 @@
+symbol,name,shares,cost,category
+0050.TW,元大台灣50,3000,74.52,ETF
+00935.TW,野村臺灣新科技50,2000,35.30,ETF
+1101.TW,台泥,5000,25.94,low_volatility
+2034.TW,允強,6000,22.45,low_volatility
+2337.TW,旺宏,1000,142.34,high_volatility
+2382.TW,廣達,2000,301.77,high_volatility
+2464.TW,盟立,2000,111.66,high_volatility
+2474.TW,可成,6000,211.24,normal
+2618.TW,長榮航,6000,37.17,normal
+2884.TW,玉山金,2000,30.18,financial
+6182.TW,合晶,12000,56.00,high_volatility

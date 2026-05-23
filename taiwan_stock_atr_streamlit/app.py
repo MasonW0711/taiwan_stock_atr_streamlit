@@ -1,0 +1,1066 @@
+from __future__ import annotations
+
+from datetime import date
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+
+BASE_DIR = Path(__file__).resolve().parent
+PORTFOLIO_SAMPLE_PATH = BASE_DIR / "portfolio_sample.csv"
+MARGIN_SAMPLE_PATH = BASE_DIR / "margin_sample.csv"
+STOP_HISTORY_SAMPLE_PATH = BASE_DIR / "stop_history_sample.csv"
+
+PORTFOLIO_REQUIRED_COLUMNS = ["symbol", "name", "shares", "cost", "category"]
+MARGIN_REQUIRED_COLUMNS = [
+    "symbol",
+    "date",
+    "margin_balance",
+    "margin_change",
+    "margin_change_rate",
+    "foreign_buy_sell",
+    "investment_trust_buy_sell",
+    "price_change_rate",
+]
+STOP_HISTORY_REQUIRED_COLUMNS = ["symbol", "name", "last_trailing_stop", "last_update_date"]
+
+DEFAULT_ATR_MULTIPLIERS = {
+    "ETF": 2.0,
+    "financial": 2.0,
+    "low_volatility": 2.0,
+    "normal": 2.0,
+    "high_volatility": 2.5,
+}
+
+REPORT_COLUMNS = [
+    "股票代號",
+    "股票名稱",
+    "股數",
+    "成本價",
+    "現價",
+    "市值",
+    "投入成本",
+    "未實現損益",
+    "未實現損益率",
+    "最近高點",
+    "最新TR",
+    "ATR",
+    "ATR倍數",
+    "原始ATR移動停利價",
+    "最終ATR移動停利價",
+    "距離停利價差",
+    "距離停利百分比",
+    "風險狀態",
+    "操作建議",
+    "融資餘額",
+    "融資增減",
+    "融資增減率",
+    "外資買賣超",
+    "投信買賣超",
+    "股價漲跌幅",
+    "融資風險",
+    "資料更新日期",
+]
+
+DISPLAY_PERCENT_COLUMNS = ["未實現損益率", "距離停利百分比", "融資增減率", "股價漲跌幅"]
+DISPLAY_NUMBER_COLUMNS = [
+    "成本價",
+    "現價",
+    "市值",
+    "投入成本",
+    "未實現損益",
+    "最近高點",
+    "最新TR",
+    "ATR",
+    "ATR倍數",
+    "原始ATR移動停利價",
+    "最終ATR移動停利價",
+    "距離停利價差",
+    "融資餘額",
+    "融資增減",
+    "外資買賣超",
+    "投信買賣超",
+]
+
+RISK_DOWNLOAD_FAILURE = "資料下載失敗，暫不判斷"
+RISK_DATA_INSUFFICIENT = "資料不足，暫不判斷"
+
+
+def make_empty_margin_df() -> pd.DataFrame:
+    """建立空白融資資料表，方便缺省情境直接沿用。"""
+    return pd.DataFrame(columns=MARGIN_REQUIRED_COLUMNS)
+
+
+def make_empty_stop_history_df() -> pd.DataFrame:
+    """建立空白停利歷史資料表，供首次計算或缺檔時使用。"""
+    return pd.DataFrame(columns=STOP_HISTORY_REQUIRED_COLUMNS)
+
+
+def validate_required_columns(df: pd.DataFrame, required_columns: list[str]) -> list[str]:
+    """檢查資料表是否缺少必要欄位。"""
+    return [column for column in required_columns if column not in df.columns]
+
+
+def normalize_symbol(symbol: Any) -> str:
+    """標準化股票代號，若未帶市場尾碼則預設補上 .TW。"""
+    cleaned = str(symbol).strip().upper()
+    if cleaned and "." not in cleaned:
+        cleaned = f"{cleaned}.TW"
+    return cleaned
+
+
+def to_float(value: Any) -> float:
+    """將輸入轉成浮點數；若失敗則回傳 NaN。"""
+    series = pd.to_numeric(pd.Series([value]), errors="coerce")
+    result = series.iloc[0]
+    return float(result) if pd.notna(result) else float("nan")
+
+
+def safe_excel_value(value: Any) -> Any:
+    """把 pandas 的遺漏值轉成 openpyxl 可接受的 None。"""
+    return None if pd.isna(value) else value
+
+
+def load_local_csv_bytes(file_path: Path) -> bytes:
+    """讀取專案內建 CSV 並輸出成 UTF-8 BOM 下載內容。"""
+    return pd.read_csv(file_path).to_csv(index=False).encode("utf-8-sig")
+
+
+def is_stop_broken(current_price: Any, final_trailing_stop: Any) -> bool:
+    """判斷目前股價是否已跌破最終 ATR 移動停利價。"""
+    current = to_float(current_price)
+    stop = to_float(final_trailing_stop)
+    return pd.notna(current) and pd.notna(stop) and current <= stop
+
+
+def is_elevated_margin_risk(risk_text: Any) -> bool:
+    """判斷是否屬於需要額外注意的融資風險。"""
+    text = str(risk_text or "")
+    keywords = ["風險升高", "惡化", "過熱", "提高移動停利紀律"]
+    return any(keyword in text for keyword in keywords)
+
+
+def determine_risk_and_action(current_price: Any, final_trailing_stop: Any, cost: Any) -> tuple[str, str]:
+    """依股價、成本與停利價關係回傳風險狀態與操作建議。"""
+    current = to_float(current_price)
+    stop = to_float(final_trailing_stop)
+    cost_value = to_float(cost)
+
+    if pd.isna(current) or pd.isna(stop) or pd.isna(cost_value):
+        return RISK_DATA_INSUFFICIENT, "資料不足，暫不操作"
+
+    if current <= stop and current > cost_value:
+        return "跌破ATR移動停利，建議分批停利", "建議分批停利或至少減碼"
+
+    if current <= stop and current <= cost_value:
+        return "低於成本且跌破ATR防守，建議減碼或停損", "建議減碼或停損，避免虧損擴大"
+
+    if current > stop and current > cost_value:
+        return "獲利中，尚未跌破移動停利，續抱觀察", "續抱，停利線只上移不下移"
+
+    return "低於成本但尚未跌破ATR防守，觀察反彈", "暫不加碼，觀察是否站回成本"
+
+
+# 1. 讀取使用者上傳的 CSV。
+def load_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
+    """讀取使用者上傳的 CSV，優先支援 UTF-8 與常見繁中編碼。"""
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    file_bytes = uploaded_file.getvalue()
+    if not file_bytes:
+        raise ValueError("上傳的 CSV 內容是空的。")
+
+    for encoding in ("utf-8-sig", "utf-8", "cp950", "big5"):
+        try:
+            return pd.read_csv(BytesIO(file_bytes), encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+        except pd.errors.EmptyDataError as exc:
+            raise ValueError("上傳的 CSV 內容是空的。") from exc
+
+    raise ValueError("無法解析 CSV，請確認檔案為 UTF-8 或 Big5 編碼。")
+
+
+# 2. 載入專案內建的 portfolio 樣板檔。
+def load_sample_portfolio() -> pd.DataFrame:
+    """載入專案提供的 portfolio_sample.csv，方便使用者下載修改。"""
+    return pd.read_csv(PORTFOLIO_SAMPLE_PATH)
+
+
+# 3. 載入融資資料，若缺省則回傳空表並由後續流程顯示預設文字。
+def load_margin_data(uploaded_file: Any) -> pd.DataFrame:
+    """載入使用者上傳的融資資料並完成欄位與型別清理。"""
+    if uploaded_file is None:
+        return make_empty_margin_df()
+
+    try:
+        margin_df = load_uploaded_csv(uploaded_file)
+    except ValueError as exc:
+        margin_df = make_empty_margin_df()
+        margin_df.attrs["validation_error"] = str(exc)
+        return margin_df
+
+    missing_columns = validate_required_columns(margin_df, MARGIN_REQUIRED_COLUMNS)
+    if missing_columns:
+        empty_df = make_empty_margin_df()
+        empty_df.attrs["missing_columns"] = missing_columns
+        return empty_df
+
+    margin_df = margin_df.copy()
+    margin_df["symbol"] = margin_df["symbol"].map(normalize_symbol)
+    margin_df["date"] = pd.to_datetime(margin_df["date"], errors="coerce")
+
+    for column in [
+        "margin_balance",
+        "margin_change",
+        "margin_change_rate",
+        "foreign_buy_sell",
+        "investment_trust_buy_sell",
+        "price_change_rate",
+    ]:
+        margin_df[column] = pd.to_numeric(margin_df[column], errors="coerce")
+
+    margin_df = margin_df.dropna(subset=["symbol"])
+    margin_df["date"] = margin_df["date"].dt.strftime("%Y-%m-%d")
+    return margin_df
+
+
+# 4. 載入停利歷史檔，若未提供則從空白歷史開始。
+def load_stop_history(uploaded_file: Any) -> pd.DataFrame:
+    """載入 stop_history.csv，並把歷史停利價整理成可比較的數值欄位。"""
+    if uploaded_file is None:
+        return make_empty_stop_history_df()
+
+    try:
+        stop_history_df = load_uploaded_csv(uploaded_file)
+    except ValueError as exc:
+        stop_history_df = make_empty_stop_history_df()
+        stop_history_df.attrs["validation_error"] = str(exc)
+        return stop_history_df
+
+    missing_columns = validate_required_columns(stop_history_df, STOP_HISTORY_REQUIRED_COLUMNS)
+    if missing_columns:
+        empty_df = make_empty_stop_history_df()
+        empty_df.attrs["missing_columns"] = missing_columns
+        return empty_df
+
+    stop_history_df = stop_history_df.copy()
+    stop_history_df["symbol"] = stop_history_df["symbol"].map(normalize_symbol)
+    stop_history_df["last_trailing_stop"] = pd.to_numeric(
+        stop_history_df["last_trailing_stop"], errors="coerce"
+    )
+    stop_history_df["last_update_date"] = pd.to_datetime(
+        stop_history_df["last_update_date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    stop_history_df = stop_history_df.dropna(subset=["symbol"])
+    return stop_history_df
+
+
+# 5. 下載單一股票日線資料，並以 Streamlit 快取減少重複抓取。
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_stock_data(symbol: str) -> dict[str, Any]:
+    """從 yfinance 下載單一股票最近至少 120 天以上的日線 OHLCV 資料。"""
+    normalized_symbol = normalize_symbol(symbol)
+
+    try:
+        end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+        start_date = end_date - pd.Timedelta(days=365)
+        stock_df = yf.download(
+            normalized_symbol,
+            start=start_date,
+            end=end_date,
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": str(exc),
+            "data": pd.DataFrame(),
+        }
+
+    if stock_df is None or stock_df.empty:
+        return {
+            "success": False,
+            "message": "查無有效日線資料。",
+            "data": pd.DataFrame(),
+        }
+
+    if isinstance(stock_df.columns, pd.MultiIndex):
+        stock_df.columns = stock_df.columns.get_level_values(0)
+
+    required_columns = ["Open", "High", "Low", "Close", "Volume"]
+    missing_columns = validate_required_columns(stock_df, required_columns)
+    if missing_columns:
+        return {
+            "success": False,
+            "message": f"缺少欄位：{', '.join(missing_columns)}",
+            "data": pd.DataFrame(),
+        }
+
+    stock_df = stock_df[required_columns].copy()
+    stock_df = stock_df.dropna(subset=["High", "Low", "Close"])
+    stock_df.index = pd.to_datetime(stock_df.index)
+    return {
+        "success": True,
+        "message": "",
+        "data": stock_df,
+    }
+
+
+# 6. 計算標準 ATR 所需的 TR 與 ATR 欄位。
+def calculate_atr(stock_df: pd.DataFrame, atr_period: int) -> pd.DataFrame:
+    """依標準公式計算每日 TR 與 ATR，回傳附加欄位後的資料表。"""
+    atr_df = stock_df.copy()
+    if atr_df.empty:
+        return atr_df
+
+    atr_df["PreviousClose"] = atr_df["Close"].shift(1)
+    atr_df["TR"] = pd.concat(
+        [
+            atr_df["High"] - atr_df["Low"],
+            (atr_df["High"] - atr_df["PreviousClose"]).abs(),
+            (atr_df["Low"] - atr_df["PreviousClose"]).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr_df.loc[atr_df["PreviousClose"].isna(), "TR"] = atr_df["High"] - atr_df["Low"]
+    atr_df["ATR"] = atr_df["TR"].rolling(window=atr_period, min_periods=atr_period).mean()
+    return atr_df
+
+
+# 7. 依照持股類型回傳 ATR 倍數，並允許使用者用側邊欄手動覆寫。
+def get_atr_multiplier(category: Any, multiplier_settings: dict[str, float]) -> float:
+    """根據持股類型決定 ATR 倍數；找不到時回傳預設值 2.0。"""
+    category_text = str(category).strip()
+    if category_text in multiplier_settings:
+        return float(multiplier_settings[category_text])
+    return 2.0
+
+
+# 8. 計算 recent high、最新 TR、ATR 與原始移動停利價。
+def calculate_trailing_stop(
+    stock_df: pd.DataFrame, atr_multiplier: float, high_period: int
+) -> dict[str, Any]:
+    """使用最近高點與 ATR 倍數計算原始 ATR 移動停利價。"""
+    if stock_df.empty or "ATR" not in stock_df.columns:
+        return {"success": False, "message": RISK_DATA_INSUFFICIENT}
+
+    latest_atr = stock_df["ATR"].iloc[-1]
+    latest_tr = stock_df["TR"].iloc[-1] if "TR" in stock_df.columns else float("nan")
+    if len(stock_df) < high_period or pd.isna(latest_atr):
+        return {
+            "success": False,
+            "message": RISK_DATA_INSUFFICIENT,
+            "latest_tr": latest_tr,
+            "atr": latest_atr,
+        }
+
+    recent_window = stock_df.tail(high_period)
+    recent_high = recent_window["High"].max()
+    raw_trailing_stop = recent_high - (latest_atr * atr_multiplier)
+    return {
+        "success": True,
+        "message": "",
+        "recent_high": recent_high,
+        "latest_tr": latest_tr,
+        "atr": latest_atr,
+        "raw_trailing_stop": raw_trailing_stop,
+    }
+
+
+# 9. 根據舊 stop history 決定本次最終停利價，確保停利線只能上移。
+def update_final_trailing_stop(
+    symbol: str, name: str, raw_trailing_stop: Any, stop_history_df: pd.DataFrame
+) -> dict[str, Any]:
+    """比較新舊停利價，若歷史停利價較高則維持歷史值。"""
+    del name
+    raw_stop = to_float(raw_trailing_stop)
+    if pd.isna(raw_stop):
+        return {"last_trailing_stop": float("nan"), "final_trailing_stop": float("nan")}
+
+    if stop_history_df.empty:
+        return {"last_trailing_stop": float("nan"), "final_trailing_stop": raw_stop}
+
+    matched = stop_history_df[stop_history_df["symbol"] == normalize_symbol(symbol)].copy()
+    if matched.empty:
+        return {"last_trailing_stop": float("nan"), "final_trailing_stop": raw_stop}
+
+    last_trailing_stop = pd.to_numeric(matched["last_trailing_stop"], errors="coerce").max()
+    if pd.isna(last_trailing_stop):
+        return {"last_trailing_stop": float("nan"), "final_trailing_stop": raw_stop}
+
+    return {
+        "last_trailing_stop": last_trailing_stop,
+        "final_trailing_stop": max(raw_stop, float(last_trailing_stop)),
+    }
+
+
+# 10. 依照融資資料規則判斷單一股票的籌碼風險。
+def calculate_margin_risk(symbol: str, margin_df: pd.DataFrame) -> dict[str, Any]:
+    """整合融資與法人資料，回傳融資風險文字與相關欄位值。"""
+    result = {
+        "融資餘額": pd.NA,
+        "融資增減": pd.NA,
+        "融資增減率": pd.NA,
+        "外資買賣超": pd.NA,
+        "投信買賣超": pd.NA,
+        "股價漲跌幅": pd.NA,
+        "融資風險": "尚未提供融資資料",
+        "margin_date": None,
+    }
+
+    if margin_df.empty:
+        return result
+
+    matched = margin_df[margin_df["symbol"] == normalize_symbol(symbol)].copy()
+    if matched.empty:
+        return result
+
+    matched["date"] = pd.to_datetime(matched["date"], errors="coerce")
+    matched = matched.sort_values("date")
+    row = matched.iloc[-1]
+
+    margin_change_rate = to_float(row.get("margin_change_rate"))
+    foreign_buy_sell = to_float(row.get("foreign_buy_sell"))
+    investment_trust_buy_sell = to_float(row.get("investment_trust_buy_sell"))
+    price_change_rate = to_float(row.get("price_change_rate"))
+
+    risk_text = "融資變化中性，持續追蹤"
+    if (
+        pd.notna(foreign_buy_sell)
+        and pd.notna(investment_trust_buy_sell)
+        and pd.notna(margin_change_rate)
+        and foreign_buy_sell < 0
+        and investment_trust_buy_sell < 0
+        and margin_change_rate > 0
+    ):
+        risk_text = "法人賣超但融資增加，散戶接籌碼風險升高"
+    elif pd.notna(margin_change_rate) and pd.notna(price_change_rate) and margin_change_rate > 5 and price_change_rate < 0:
+        risk_text = "融資增加但股價下跌，籌碼惡化"
+    elif pd.notna(margin_change_rate) and pd.notna(price_change_rate) and margin_change_rate > 10 and price_change_rate <= 3:
+        risk_text = "融資大增但股價漲幅有限，短線過熱"
+    elif pd.notna(margin_change_rate) and pd.notna(price_change_rate) and margin_change_rate > 10 and price_change_rate > 5:
+        risk_text = "融資大增且股價強漲，續抱但需提高移動停利紀律"
+    elif pd.notna(margin_change_rate) and margin_change_rate <= 0:
+        risk_text = "融資未增加，籌碼壓力較低"
+
+    result.update(
+        {
+            "融資餘額": row.get("margin_balance", pd.NA),
+            "融資增減": row.get("margin_change", pd.NA),
+            "融資增減率": row.get("margin_change_rate", pd.NA),
+            "外資買賣超": row.get("foreign_buy_sell", pd.NA),
+            "投信買賣超": row.get("investment_trust_buy_sell", pd.NA),
+            "股價漲跌幅": row.get("price_change_rate", pd.NA),
+            "融資風險": risk_text,
+            "margin_date": row.get("date"),
+        }
+    )
+    return result
+
+
+# 11. 整合 portfolio、股價、停利歷史與融資資料，產出最終中文報表。
+def build_report(
+    portfolio_df: pd.DataFrame,
+    margin_df: pd.DataFrame,
+    stop_history_df: pd.DataFrame,
+    settings: dict[str, Any],
+) -> pd.DataFrame:
+    """建立完整 ATR 報表，單檔失敗不影響整體結果。"""
+    report_rows: list[dict[str, Any]] = []
+    processing_messages: list[str] = []
+
+    working_portfolio = portfolio_df.copy()
+    working_portfolio["symbol"] = working_portfolio["symbol"].map(normalize_symbol)
+
+    for _, row in working_portfolio.iterrows():
+        symbol = normalize_symbol(row.get("symbol", ""))
+        name = str(row.get("name", "")).strip()
+        shares = to_float(row.get("shares"))
+        cost = to_float(row.get("cost"))
+        category = row.get("category", "normal")
+        atr_multiplier = get_atr_multiplier(category, settings["multiplier_settings"])
+        cost_value = shares * cost if pd.notna(shares) and pd.notna(cost) else float("nan")
+
+        report_row = {column: pd.NA for column in REPORT_COLUMNS}
+        report_row.update(
+            {
+                "股票代號": symbol,
+                "股票名稱": name,
+                "股數": shares,
+                "成本價": cost,
+                "投入成本": cost_value,
+                "ATR倍數": atr_multiplier,
+                "風險狀態": RISK_DATA_INSUFFICIENT,
+                "操作建議": "資料不足，暫不操作",
+                "融資風險": "尚未提供融資資料",
+                "資料更新日期": date.today().isoformat(),
+            }
+        )
+
+        margin_info = calculate_margin_risk(symbol, margin_df)
+        for field in ["融資餘額", "融資增減", "融資增減率", "外資買賣超", "投信買賣超", "股價漲跌幅", "融資風險"]:
+            report_row[field] = margin_info[field]
+
+        margin_date = margin_info.get("margin_date")
+        if pd.notna(margin_date):
+            report_row["資料更新日期"] = pd.to_datetime(margin_date).strftime("%Y-%m-%d")
+
+        if not symbol or pd.isna(shares) or pd.isna(cost):
+            report_row["風險狀態"] = "持股資料格式錯誤，暫不判斷"
+            report_row["操作建議"] = "請修正 portfolio.csv 後重新上傳"
+            report_rows.append(report_row)
+            continue
+
+        download_result = download_stock_data(symbol)
+        if not download_result["success"]:
+            report_row["風險狀態"] = RISK_DOWNLOAD_FAILURE
+            report_row["操作建議"] = "資料不足，暫不操作"
+            processing_messages.append(f"{symbol} 股價下載失敗：{download_result['message']}")
+            report_rows.append(report_row)
+            continue
+
+        stock_df = download_result["data"]
+        if stock_df.empty:
+            report_row["風險狀態"] = RISK_DOWNLOAD_FAILURE
+            report_row["操作建議"] = "資料不足，暫不操作"
+            processing_messages.append(f"{symbol} 股價下載失敗：回傳空白資料。")
+            report_rows.append(report_row)
+            continue
+
+        latest_close = to_float(stock_df["Close"].iloc[-1])
+        market_value = latest_close * shares if pd.notna(latest_close) and pd.notna(shares) else float("nan")
+        unrealized_profit = market_value - cost_value if pd.notna(market_value) and pd.notna(cost_value) else float("nan")
+        unrealized_profit_rate = (
+            (unrealized_profit / cost_value) * 100
+            if pd.notna(unrealized_profit) and pd.notna(cost_value) and cost_value != 0
+            else float("nan")
+        )
+
+        report_row.update(
+            {
+                "現價": latest_close,
+                "市值": market_value,
+                "未實現損益": unrealized_profit,
+                "未實現損益率": unrealized_profit_rate,
+                "資料更新日期": stock_df.index[-1].strftime("%Y-%m-%d"),
+            }
+        )
+
+        atr_df = calculate_atr(stock_df, settings["atr_period"])
+        trailing_stop_result = calculate_trailing_stop(atr_df, atr_multiplier, settings["high_period"])
+
+        if not trailing_stop_result["success"]:
+            report_row["最新TR"] = trailing_stop_result.get("latest_tr", pd.NA)
+            report_row["ATR"] = trailing_stop_result.get("atr", pd.NA)
+            report_row["風險狀態"] = RISK_DATA_INSUFFICIENT
+            report_row["操作建議"] = "資料不足，暫不操作"
+            processing_messages.append(f"{symbol} 資料不足：ATR 週期或最近高點期間不足。")
+            report_rows.append(report_row)
+            continue
+
+        raw_trailing_stop = trailing_stop_result["raw_trailing_stop"]
+        stop_update = update_final_trailing_stop(symbol, name, raw_trailing_stop, stop_history_df)
+        final_trailing_stop = stop_update["final_trailing_stop"]
+        distance_to_stop = (
+            latest_close - final_trailing_stop
+            if pd.notna(latest_close) and pd.notna(final_trailing_stop)
+            else float("nan")
+        )
+        distance_to_stop_rate = (
+            (distance_to_stop / latest_close) * 100
+            if pd.notna(distance_to_stop) and pd.notna(latest_close) and latest_close != 0
+            else float("nan")
+        )
+        risk_status, action_suggestion = determine_risk_and_action(latest_close, final_trailing_stop, cost)
+
+        report_row.update(
+            {
+                "最近高點": trailing_stop_result["recent_high"],
+                "最新TR": trailing_stop_result["latest_tr"],
+                "ATR": trailing_stop_result["atr"],
+                "原始ATR移動停利價": raw_trailing_stop,
+                "最終ATR移動停利價": final_trailing_stop,
+                "距離停利價差": distance_to_stop,
+                "距離停利百分比": distance_to_stop_rate,
+                "風險狀態": risk_status,
+                "操作建議": action_suggestion,
+            }
+        )
+        report_rows.append(report_row)
+
+    report_df = pd.DataFrame(report_rows, columns=REPORT_COLUMNS)
+    report_df.attrs["processing_messages"] = processing_messages
+    return report_df
+
+
+# 12. 依本次報表結果產出新的 stop_history.csv，供使用者下次再上傳。
+def build_updated_stop_history(
+    report_df: pd.DataFrame, old_stop_history_df: pd.DataFrame
+) -> pd.DataFrame:
+    """以本次報表中的最終 ATR 停利價更新 stop history。"""
+    rows: list[dict[str, Any]] = []
+
+    for _, row in report_df.iterrows():
+        symbol = row["股票代號"]
+        name = row["股票名稱"]
+        new_stop = to_float(row["最終ATR移動停利價"])
+        existing = old_stop_history_df[old_stop_history_df["symbol"] == symbol].copy()
+
+        old_stop = pd.to_numeric(existing.get("last_trailing_stop"), errors="coerce").max() if not existing.empty else float("nan")
+        old_update_date = None
+        if not existing.empty:
+            existing = existing.sort_values("last_update_date")
+            old_update_date = existing.iloc[-1].get("last_update_date")
+
+        final_stop = new_stop
+        update_date = row["資料更新日期"]
+        if pd.isna(final_stop) and pd.notna(old_stop):
+            final_stop = float(old_stop)
+            update_date = old_update_date
+
+        if pd.isna(final_stop):
+            continue
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "name": name,
+                "last_trailing_stop": final_stop,
+                "last_update_date": update_date,
+            }
+        )
+
+    updated_stop_history_df = pd.DataFrame(rows, columns=STOP_HISTORY_REQUIRED_COLUMNS)
+    if updated_stop_history_df.empty:
+        return updated_stop_history_df
+
+    updated_stop_history_df = updated_stop_history_df.sort_values("symbol").drop_duplicates(
+        subset=["symbol"], keep="last"
+    )
+    return updated_stop_history_df.reset_index(drop=True)
+
+
+# 13. 產生 Excel 下載內容並套用格式樣式。
+def create_excel_bytes(report_df: pd.DataFrame) -> bytes:
+    """使用 openpyxl 產生符合條件格式要求的 Excel 檔案。"""
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "ATR報表"
+
+    worksheet.append(REPORT_COLUMNS)
+    for row in report_df[REPORT_COLUMNS].itertuples(index=False, name=None):
+        worksheet.append([safe_excel_value(value) for value in row])
+
+    header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+    stop_fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
+    margin_fill = PatternFill(fill_type="solid", fgColor="F4CCCC")
+    red_font = Font(color="C00000")
+    green_font = Font(color="008000")
+
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.fill = header_fill
+
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+
+    column_index = {column: index + 1 for index, column in enumerate(REPORT_COLUMNS)}
+
+    for row_index in range(2, worksheet.max_row + 1):
+        current_price = worksheet.cell(row=row_index, column=column_index["現價"]).value
+        final_stop = worksheet.cell(row=row_index, column=column_index["最終ATR移動停利價"]).value
+        if is_stop_broken(current_price, final_stop):
+            for column_number in range(1, worksheet.max_column + 1):
+                worksheet.cell(row=row_index, column=column_number).fill = stop_fill
+
+        profit_cell = worksheet.cell(row=row_index, column=column_index["未實現損益"])
+        profit_rate_cell = worksheet.cell(row=row_index, column=column_index["未實現損益率"])
+        profit_value = to_float(profit_cell.value)
+        if pd.notna(profit_value):
+            if profit_value > 0:
+                profit_cell.font = red_font
+                profit_rate_cell.font = red_font
+            elif profit_value < 0:
+                profit_cell.font = green_font
+                profit_rate_cell.font = green_font
+
+        margin_risk_cell = worksheet.cell(row=row_index, column=column_index["融資風險"])
+        if is_elevated_margin_risk(margin_risk_cell.value):
+            margin_risk_cell.fill = margin_fill
+
+        for column_name in DISPLAY_PERCENT_COLUMNS:
+            cell = worksheet.cell(row=row_index, column=column_index[column_name])
+            if cell.value is not None:
+                cell.value = to_float(cell.value) / 100 if pd.notna(to_float(cell.value)) else None
+                cell.number_format = "0.00%"
+
+        for column_name in DISPLAY_NUMBER_COLUMNS:
+            cell = worksheet.cell(row=row_index, column=column_index[column_name])
+            if cell.value is not None:
+                cell.number_format = "#,##0.00"
+
+        shares_cell = worksheet.cell(row=row_index, column=column_index["股數"])
+        if shares_cell.value is not None:
+            shares_cell.number_format = "#,##0"
+
+    for column_number, column_name in enumerate(REPORT_COLUMNS, start=1):
+        max_length = len(str(column_name))
+        for row in range(2, worksheet.max_row + 1):
+            value = worksheet.cell(row=row, column=column_number).value
+            if value is None:
+                continue
+            max_length = max(max_length, len(str(value)))
+        worksheet.column_dimensions[get_column_letter(column_number)].width = min(max_length + 2, 36)
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+# 14. 產生報表 CSV 下載內容。
+def create_csv_bytes(report_df: pd.DataFrame) -> bytes:
+    """將報表輸出為 UTF-8 BOM CSV，方便 Excel 開啟中文欄位。"""
+    return report_df[REPORT_COLUMNS].to_csv(index=False).encode("utf-8-sig")
+
+
+# 15. 產生 updated stop history CSV 下載內容。
+def create_stop_history_csv_bytes(stop_history_df: pd.DataFrame) -> bytes:
+    """輸出更新後的 stop history CSV，讓使用者下次可再上傳。"""
+    return stop_history_df[STOP_HISTORY_REQUIRED_COLUMNS].to_csv(index=False).encode("utf-8-sig")
+
+
+def style_report_dataframe(report_df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """把報表套用 Streamlit 表格格式，包含紅綠損益與停利提示。"""
+    display_df = report_df.copy()
+
+    number_formats = {column: "{:,.2f}" for column in DISPLAY_NUMBER_COLUMNS if column in display_df.columns}
+    if "股數" in display_df.columns:
+        number_formats["股數"] = "{:,.0f}"
+    number_formats.update({column: "{:.2f}%" for column in DISPLAY_PERCENT_COLUMNS if column in display_df.columns})
+
+    def apply_row_style(row: pd.Series) -> list[str]:
+        if is_stop_broken(row.get("現價"), row.get("最終ATR移動停利價")):
+            return ["background-color: #FFF2CC"] * len(row)
+        return [""] * len(row)
+
+    def profit_color(value: Any) -> str:
+        numeric_value = to_float(value)
+        if pd.isna(numeric_value):
+            return ""
+        if numeric_value > 0:
+            return "color: #C00000; font-weight: 600"
+        if numeric_value < 0:
+            return "color: #008000; font-weight: 600"
+        return ""
+
+    def margin_risk_style(value: Any) -> str:
+        return "background-color: #F4CCCC" if is_elevated_margin_risk(value) else ""
+
+    styler = display_df.style.format(number_formats, na_rep="-").apply(apply_row_style, axis=1)
+
+    profit_subset = [column for column in ["未實現損益", "未實現損益率"] if column in display_df.columns]
+    if profit_subset:
+        styler = styler.map(profit_color, subset=profit_subset)
+
+    if "融資風險" in display_df.columns:
+        styler = styler.map(margin_risk_style, subset=["融資風險"])
+
+    return styler
+
+
+# 16. 呈現主畫面的指標卡、篩選器、完整報表與注意清單。
+def render_dashboard(report_df: pd.DataFrame) -> None:
+    """把計算完成的報表渲染成可搜尋、可篩選的儀表板。"""
+    if report_df.empty:
+        st.info("目前沒有可顯示的報表資料。")
+        return
+
+    market_value_total = pd.to_numeric(report_df["市值"], errors="coerce").sum()
+    cost_total = pd.to_numeric(report_df["投入成本"], errors="coerce").sum()
+    unrealized_profit_total = pd.to_numeric(report_df["未實現損益"], errors="coerce").sum()
+    unrealized_profit_rate_total = (
+        (unrealized_profit_total / cost_total) * 100 if pd.notna(cost_total) and cost_total != 0 else 0.0
+    )
+    stop_break_count = int(
+        report_df.apply(
+            lambda row: is_stop_broken(row["現價"], row["最終ATR移動停利價"]),
+            axis=1,
+        ).sum()
+    )
+    elevated_margin_risk_count = int(report_df["融資風險"].map(is_elevated_margin_risk).sum())
+
+    metric_columns = st.columns(6)
+    metric_columns[0].metric("持股總市值", f"{market_value_total:,.2f}")
+    metric_columns[1].metric("投入成本", f"{cost_total:,.2f}")
+    metric_columns[2].metric("未實現損益", f"{unrealized_profit_total:,.2f}")
+    metric_columns[3].metric("未實現損益率", f"{unrealized_profit_rate_total:.2f}%")
+    metric_columns[4].metric("跌破移動停利股票數", f"{stop_break_count}")
+    metric_columns[5].metric("融資風險升高股票數", f"{elevated_margin_risk_count}")
+
+    st.subheader("完整報表")
+    filter_columns = st.columns([2, 2, 2])
+    search_text = filter_columns[0].text_input("搜尋股票代號或名稱", placeholder="例如 2382 或 廣達")
+    risk_options = sorted(report_df["風險狀態"].dropna().astype(str).unique().tolist())
+    selected_risk_status = filter_columns[1].multiselect("篩選風險狀態", risk_options)
+    margin_risk_options = sorted(report_df["融資風險"].dropna().astype(str).unique().tolist())
+    selected_margin_risk = filter_columns[2].multiselect("篩選融資風險", margin_risk_options)
+
+    filtered_df = report_df.copy()
+    if search_text:
+        search_lower = search_text.strip().lower()
+        filtered_df = filtered_df[
+            filtered_df["股票代號"].astype(str).str.lower().str.contains(search_lower)
+            | filtered_df["股票名稱"].astype(str).str.lower().str.contains(search_lower)
+        ]
+
+    if selected_risk_status:
+        filtered_df = filtered_df[filtered_df["風險狀態"].isin(selected_risk_status)]
+
+    if selected_margin_risk:
+        filtered_df = filtered_df[filtered_df["融資風險"].isin(selected_margin_risk)]
+
+    st.dataframe(style_report_dataframe(filtered_df), width="stretch", hide_index=True, height=560)
+
+    attention_df = report_df[
+        report_df["風險狀態"].isin(
+            [
+                "跌破ATR移動停利，建議分批停利",
+                "低於成本且跌破ATR防守，建議減碼或停損",
+                RISK_DOWNLOAD_FAILURE,
+                RISK_DATA_INSUFFICIENT,
+            ]
+        )
+        | report_df["融資風險"].map(is_elevated_margin_risk)
+    ][["股票代號", "股票名稱", "風險狀態", "操作建議", "融資風險", "距離停利百分比"]]
+
+    st.subheader("需要注意的股票清單")
+    if attention_df.empty:
+        st.success("目前沒有額外需要注意的股票。")
+    else:
+        st.dataframe(style_report_dataframe(attention_df), width="stretch", hide_index=True)
+
+
+def render_download_buttons(
+    report_df: pd.DataFrame,
+    stop_history_df: pd.DataFrame,
+    excel_error: str,
+    key_prefix: str,
+) -> None:
+    """在主畫面與側邊欄共用下載按鈕內容。"""
+    report_csv_bytes = create_csv_bytes(report_df)
+    stop_history_csv_bytes = create_stop_history_csv_bytes(stop_history_df)
+
+    st.download_button(
+        "下載 atr_report.csv",
+        data=report_csv_bytes,
+        file_name="atr_report.csv",
+        mime="text/csv",
+        width="stretch",
+        key=f"{key_prefix}-report-csv",
+    )
+    st.download_button(
+        "下載最新 stop_history.csv",
+        data=stop_history_csv_bytes,
+        file_name="updated_stop_history.csv",
+        mime="text/csv",
+        width="stretch",
+        key=f"{key_prefix}-stop-history-csv",
+    )
+
+    if excel_error:
+        st.error(f"Excel 產生失敗：{excel_error}")
+    else:
+        st.download_button(
+            "下載 atr_report.xlsx",
+            data=st.session_state.get("report_excel_bytes", b""),
+            file_name="atr_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+            key=f"{key_prefix}-report-xlsx",
+        )
+
+
+# 17. 串接側邊欄、計算流程、下載功能與主畫面渲染。
+def main() -> None:
+    """Streamlit 入口函式，負責整體頁面流程與互動控制。"""
+    st.set_page_config(page_title="台股 ATR 移動停利系統", layout="wide")
+    st.title("台股 ATR 移動停利與融資風險追蹤系統")
+    st.caption(
+        "透過 ATR14、最近高點與融資籌碼變化，快速檢查持股的移動停利位置、潛在風險與操作建議。"
+    )
+
+    for key, default_value in {
+        "report_df": pd.DataFrame(columns=REPORT_COLUMNS),
+        "updated_stop_history_df": make_empty_stop_history_df(),
+        "processing_messages": [],
+        "report_excel_bytes": b"",
+        "excel_error": "",
+    }.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_value
+
+    sample_portfolio_df = load_sample_portfolio()
+    sample_portfolio_bytes = load_local_csv_bytes(PORTFOLIO_SAMPLE_PATH)
+    sample_margin_bytes = load_local_csv_bytes(MARGIN_SAMPLE_PATH)
+    sample_stop_history_bytes = load_local_csv_bytes(STOP_HISTORY_SAMPLE_PATH)
+
+    with st.sidebar:
+        st.header("資料輸入")
+        portfolio_file = st.file_uploader("上傳 portfolio.csv", type=["csv"])
+        margin_file = st.file_uploader("上傳 margin.csv（選填）", type=["csv"])
+        stop_history_file = st.file_uploader("上傳 stop_history.csv（選填）", type=["csv"])
+
+        st.subheader("參數設定")
+        atr_period = st.number_input("ATR 週期", min_value=2, max_value=60, value=14, step=1)
+        high_period = st.number_input("最近高點期間", min_value=2, max_value=120, value=20, step=1)
+
+        st.subheader("ATR 倍數設定")
+        multiplier_settings = {
+            "ETF": st.number_input("ETF 倍數", min_value=0.5, max_value=10.0, value=2.0, step=0.1),
+            "financial": st.number_input("financial 倍數", min_value=0.5, max_value=10.0, value=2.0, step=0.1),
+            "low_volatility": st.number_input(
+                "low_volatility 倍數", min_value=0.5, max_value=10.0, value=2.0, step=0.1
+            ),
+            "normal": st.number_input("normal 倍數", min_value=0.5, max_value=10.0, value=2.0, step=0.1),
+            "high_volatility": st.number_input(
+                "high_volatility 倍數", min_value=0.5, max_value=10.0, value=2.5, step=0.1
+            ),
+        }
+
+        calculate_button = st.button("開始計算", type="primary", width="stretch")
+
+        st.subheader("範例檔下載")
+        st.download_button(
+            "下載 portfolio_sample.csv",
+            data=sample_portfolio_bytes,
+            file_name="portfolio_sample.csv",
+            mime="text/csv",
+            width="stretch",
+            key="sidebar-sample-portfolio",
+        )
+        st.download_button(
+            "下載 margin_sample.csv",
+            data=sample_margin_bytes,
+            file_name="margin_sample.csv",
+            mime="text/csv",
+            width="stretch",
+            key="sidebar-sample-margin",
+        )
+        st.download_button(
+            "下載 stop_history_sample.csv",
+            data=sample_stop_history_bytes,
+            file_name="stop_history_sample.csv",
+            mime="text/csv",
+            width="stretch",
+            key="sidebar-sample-stop-history",
+        )
+
+        if not st.session_state["report_df"].empty:
+            st.subheader("下載區")
+            render_download_buttons(
+                st.session_state["report_df"],
+                st.session_state["updated_stop_history_df"],
+                st.session_state["excel_error"],
+                "sidebar",
+            )
+
+    if calculate_button:
+        if portfolio_file is None:
+            st.warning("尚未上傳 portfolio.csv，請先上傳持股資料，或先下載 sample CSV 進行修改。")
+        else:
+            try:
+                portfolio_df = load_uploaded_csv(portfolio_file)
+            except ValueError as exc:
+                st.error(f"portfolio.csv 讀取失敗：{exc}")
+                portfolio_df = pd.DataFrame()
+
+            missing_columns = validate_required_columns(portfolio_df, PORTFOLIO_REQUIRED_COLUMNS)
+            if missing_columns:
+                st.error(f"portfolio.csv 缺少必要欄位：{', '.join(missing_columns)}")
+            elif portfolio_df.empty:
+                st.error("portfolio.csv 內容為空，請確認檔案後重新上傳。")
+            else:
+                margin_df = load_margin_data(margin_file)
+                stop_history_df = load_stop_history(stop_history_file)
+
+                if margin_df.attrs.get("validation_error"):
+                    st.warning(f"margin.csv 讀取失敗，將略過融資分析：{margin_df.attrs['validation_error']}")
+                if margin_df.attrs.get("missing_columns"):
+                    st.warning(
+                        "margin.csv 缺少欄位，將略過融資分析："
+                        + ", ".join(margin_df.attrs["missing_columns"])
+                    )
+
+                if stop_history_df.attrs.get("validation_error"):
+                    st.warning(f"stop_history.csv 讀取失敗，將從空白歷史開始：{stop_history_df.attrs['validation_error']}")
+                if stop_history_df.attrs.get("missing_columns"):
+                    st.warning(
+                        "stop_history.csv 缺少欄位，將從空白歷史開始："
+                        + ", ".join(stop_history_df.attrs["missing_columns"])
+                    )
+
+                settings = {
+                    "atr_period": int(atr_period),
+                    "high_period": int(high_period),
+                    "multiplier_settings": multiplier_settings,
+                }
+
+                with st.spinner("正在下載股價、計算 ATR 與整理報表..."):
+                    report_df = build_report(portfolio_df, margin_df, stop_history_df, settings)
+                    updated_stop_history_df = build_updated_stop_history(report_df, stop_history_df)
+
+                st.session_state["report_df"] = report_df
+                st.session_state["updated_stop_history_df"] = updated_stop_history_df
+                st.session_state["processing_messages"] = report_df.attrs.get("processing_messages", [])
+
+                try:
+                    st.session_state["report_excel_bytes"] = create_excel_bytes(report_df)
+                    st.session_state["excel_error"] = ""
+                except Exception as exc:
+                    st.session_state["report_excel_bytes"] = b""
+                    st.session_state["excel_error"] = str(exc)
+
+    if portfolio_file is None and st.session_state["report_df"].empty:
+        st.info("請先上傳 portfolio.csv，系統才會開始計算 ATR、移動停利與融資風險。")
+        st.download_button(
+            "下載 portfolio_sample.csv",
+            data=sample_portfolio_bytes,
+            file_name="portfolio_sample.csv",
+            mime="text/csv",
+            key="main-sample-portfolio",
+        )
+        st.subheader("portfolio_sample.csv 預覽")
+        st.dataframe(sample_portfolio_df, width="stretch", hide_index=True)
+
+    if not st.session_state["report_df"].empty:
+        render_dashboard(st.session_state["report_df"])
+
+        if st.session_state["processing_messages"]:
+            with st.expander("處理訊息與警示"):
+                for message in st.session_state["processing_messages"]:
+                    st.write(f"- {message}")
+
+        st.subheader("下載區")
+        render_download_buttons(
+            st.session_state["report_df"],
+            st.session_state["updated_stop_history_df"],
+            st.session_state["excel_error"],
+            "main",
+        )
+
+
+if __name__ == "__main__":
+    main()
