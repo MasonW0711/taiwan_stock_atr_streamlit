@@ -173,6 +173,32 @@ def normalize_symbol(symbol: Any) -> str:
     return cleaned
 
 
+def get_symbol_code(symbol: Any) -> str:
+    """取出股票代號主體，忽略 .TW / .TWO 市場尾碼。"""
+    cleaned = str(symbol).strip().upper()
+    if not cleaned:
+        return ""
+    return cleaned.split(".", 1)[0]
+
+
+def build_symbol_lookup_candidates(symbol: Any) -> list[str]:
+    """建立 Yahoo Finance 查價候選代號，支援上市與上櫃尾碼 fallback。"""
+    cleaned = str(symbol).strip().upper()
+    if not cleaned:
+        return []
+
+    if "." not in cleaned:
+        return [f"{cleaned}.TW", f"{cleaned}.TWO"]
+
+    symbol_code, market_suffix = cleaned.rsplit(".", 1)
+    candidates = [cleaned]
+    if market_suffix == "TW":
+        candidates.append(f"{symbol_code}.TWO")
+    elif market_suffix == "TWO":
+        candidates.append(f"{symbol_code}.TW")
+    return candidates
+
+
 def to_float(value: Any) -> float:
     """將輸入轉成浮點數；若失敗則回傳 NaN。"""
     series = pd.to_numeric(pd.Series([value]), errors="coerce")
@@ -590,53 +616,54 @@ def load_stop_history(uploaded_file: Any) -> pd.DataFrame:
 @st.cache_data(ttl=3600, show_spinner=False)
 def download_stock_data(symbol: str) -> dict[str, Any]:
     """從 yfinance 下載單一股票最近至少 120 天以上的日線 OHLCV 資料。"""
-    normalized_symbol = normalize_symbol(symbol)
-
-    try:
-        end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
-        start_date = end_date - pd.Timedelta(days=365)
-        stock_df = yf.download(
-            normalized_symbol,
-            start=start_date,
-            end=end_date,
-            interval="1d",
-            progress=False,
-            auto_adjust=False,
-            threads=False,
-        )
-    except Exception as exc:
-        return {
-            "success": False,
-            "message": str(exc),
-            "data": pd.DataFrame(),
-        }
-
-    if stock_df is None or stock_df.empty:
-        return {
-            "success": False,
-            "message": "查無有效日線資料。",
-            "data": pd.DataFrame(),
-        }
-
-    if isinstance(stock_df.columns, pd.MultiIndex):
-        stock_df.columns = stock_df.columns.get_level_values(0)
-
+    candidate_symbols = build_symbol_lookup_candidates(symbol)
+    end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+    start_date = end_date - pd.Timedelta(days=365)
     required_columns = ["Open", "High", "Low", "Close", "Volume"]
-    missing_columns = validate_required_columns(stock_df, required_columns)
-    if missing_columns:
+    failure_messages: list[str] = []
+
+    for candidate_symbol in candidate_symbols:
+        try:
+            stock_df = yf.download(
+                candidate_symbol,
+                start=start_date,
+                end=end_date,
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+            )
+        except Exception as exc:
+            failure_messages.append(f"{candidate_symbol}: {exc}")
+            continue
+
+        if stock_df is None or stock_df.empty:
+            failure_messages.append(f"{candidate_symbol}: 查無有效日線資料。")
+            continue
+
+        if isinstance(stock_df.columns, pd.MultiIndex):
+            stock_df.columns = stock_df.columns.get_level_values(0)
+
+        missing_columns = validate_required_columns(stock_df, required_columns)
+        if missing_columns:
+            failure_messages.append(f"{candidate_symbol}: 缺少欄位：{', '.join(missing_columns)}")
+            continue
+
+        stock_df = stock_df[required_columns].copy()
+        stock_df = stock_df.dropna(subset=["High", "Low", "Close"])
+        stock_df.index = pd.to_datetime(stock_df.index)
         return {
-            "success": False,
-            "message": f"缺少欄位：{', '.join(missing_columns)}",
-            "data": pd.DataFrame(),
+            "success": True,
+            "message": "",
+            "data": stock_df,
+            "symbol": candidate_symbol,
         }
 
-    stock_df = stock_df[required_columns].copy()
-    stock_df = stock_df.dropna(subset=["High", "Low", "Close"])
-    stock_df.index = pd.to_datetime(stock_df.index)
     return {
-        "success": True,
-        "message": "",
-        "data": stock_df,
+        "success": False,
+        "message": "；".join(failure_messages) if failure_messages else "查無有效日線資料。",
+        "data": pd.DataFrame(),
+        "symbol": normalize_symbol(symbol),
     }
 
 
@@ -714,7 +741,11 @@ def update_final_trailing_stop(
     if stop_history_df.empty:
         return {"last_trailing_stop": float("nan"), "final_trailing_stop": raw_stop}
 
-    matched = stop_history_df[stop_history_df["symbol"] == normalize_symbol(symbol)].copy()
+    normalized_symbol = normalize_symbol(symbol)
+    matched = stop_history_df[stop_history_df["symbol"] == normalized_symbol].copy()
+    if matched.empty:
+        symbol_code = get_symbol_code(normalized_symbol)
+        matched = stop_history_df[stop_history_df["symbol"].map(get_symbol_code) == symbol_code].copy()
     if matched.empty:
         return {"last_trailing_stop": float("nan"), "final_trailing_stop": raw_stop}
 
@@ -745,7 +776,11 @@ def calculate_margin_risk(symbol: str, margin_df: pd.DataFrame) -> dict[str, Any
     if margin_df.empty:
         return result
 
-    matched = margin_df[margin_df["symbol"] == normalize_symbol(symbol)].copy()
+    normalized_symbol = normalize_symbol(symbol)
+    matched = margin_df[margin_df["symbol"] == normalized_symbol].copy()
+    if matched.empty:
+        symbol_code = get_symbol_code(normalized_symbol)
+        matched = margin_df[margin_df["symbol"].map(get_symbol_code) == symbol_code].copy()
     if matched.empty:
         return result
 
@@ -853,6 +888,8 @@ def build_report(
             report_rows.append(report_row)
             continue
 
+        symbol = normalize_symbol(download_result.get("symbol", symbol))
+        report_row["股票代號"] = symbol
         stock_df = download_result["data"]
         if stock_df.empty:
             report_row["風險狀態"] = RISK_DOWNLOAD_FAILURE
