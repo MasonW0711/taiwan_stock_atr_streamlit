@@ -1019,8 +1019,7 @@ def load_stop_history(uploaded_file: Any) -> pd.DataFrame:
 
 
 # 5. 下載單一股票日線資料，並以 Streamlit 快取減少重複抓取。
-@st.cache_data(ttl=3600, show_spinner=False)
-def download_stock_data(symbol: str) -> dict[str, Any]:
+def download_stock_data_impl(symbol: str) -> dict[str, Any]:
     """從 yfinance 下載單一股票最近至少 120 天以上的日線 OHLCV 資料。"""
     candidate_symbols = build_symbol_lookup_candidates(symbol)
     end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
@@ -1071,6 +1070,25 @@ def download_stock_data(symbol: str) -> dict[str, Any]:
         "data": pd.DataFrame(),
         "symbol": normalize_symbol(symbol),
     }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_stock_data_cached(symbol: str) -> dict[str, Any]:
+    """快取成功的股價下載結果，降低重複請求頻率。"""
+    return download_stock_data_impl(symbol)
+
+
+def download_stock_data(symbol: str) -> dict[str, Any]:
+    """取得股價資料；若快取命中的是失敗結果，會即時重試一次。"""
+    cached_result = download_stock_data_cached(symbol)
+    if cached_result.get("success"):
+        return cached_result
+
+    live_result = download_stock_data_impl(symbol)
+    if live_result.get("success"):
+        download_stock_data_cached.clear()
+        return live_result
+    return live_result
 
 
 # 6. 計算標準 ATR 所需的 TR 與 ATR 欄位。
