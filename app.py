@@ -132,7 +132,14 @@ def format_ocr_error_message(error: Exception) -> str:
         return (
             "部署環境缺少 libGL 系統套件，導致 OCR 模組無法載入。"
             "若部署在 Streamlit Community Cloud，請確認專案根目錄有 packages.txt，"
-            "並讓平台重新部署以安裝 libgl1、libglib2.0-0 等系統套件。"
+            "並讓平台重新部署以安裝 libgl1 與對應 Debian 版本的 libglib runtime。"
+        )
+
+    if "libgthread-2.0.so.0" in lowered or "libglib-2.0.so.0" in lowered:
+        return (
+            "部署環境缺少 glib runtime，導致 OCR 模組無法載入。"
+            "若部署在 Streamlit Community Cloud，請確認 packages.txt 使用與目前 Debian 版本相容的 glib 套件"
+            "（例如 trixie 環境使用 libglib2.0-0t64），再重新部署。"
         )
 
     return message
