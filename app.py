@@ -1074,9 +1074,14 @@ def style_report_dataframe(report_df: pd.DataFrame) -> pd.io.formats.style.Style
     number_formats.update({column: "{:.2f}%" for column in DISPLAY_PERCENT_COLUMNS if column in display_df.columns})
 
     def apply_row_style(row: pd.Series) -> list[str]:
-        if is_stop_broken(row.get("現價"), row.get("最終ATR移動停利價")):
-            return ["background-color: #FFF2CC"] * len(row)
-        return [""] * len(row)
+        if not is_stop_broken(row.get("現價"), row.get("最終ATR移動停利價")):
+            return [""] * len(row)
+
+        row_styles = ["border-top: 2px solid #F59E0B; border-bottom: 2px solid #F59E0B;"] * len(row)
+        if row_styles:
+            row_styles[0] += " border-left: 4px solid #F59E0B;"
+            row_styles[-1] += " border-right: 4px solid #F59E0B;"
+        return row_styles
 
     def profit_color(value: Any) -> str:
         numeric_value = to_float(value)
@@ -1221,7 +1226,7 @@ def main() -> None:
     st.set_page_config(page_title="台股 ATR 移動停利系統", layout="wide")
     st.title("台股 ATR 移動停利與融資風險追蹤系統")
     st.caption(
-        "透過 ATR14、最近高點與融資籌碼變化，快速檢查持股的移動停利位置、潛在風險與操作建議。"
+        "透過 ATR、最近高點與融資籌碼變化，快速檢查持股的移動停利位置、潛在風險與操作建議。"
     )
 
     for key, default_value in {
@@ -1268,7 +1273,7 @@ def main() -> None:
         ocr_parse_button = st.button("辨識持股截圖", width="stretch")
 
         st.subheader("參數設定")
-        atr_period = st.number_input("ATR 週期", min_value=2, max_value=60, value=14, step=1)
+        atr_period = st.number_input("ATR 週期", min_value=2, max_value=60, value=5, step=1)
         high_period = st.number_input("最近高點期間", min_value=2, max_value=120, value=20, step=1)
 
         st.subheader("ATR 倍數設定")
