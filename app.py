@@ -73,6 +73,9 @@ OCR_NON_NAME_TOKENS = {
     "融券回補",
 }
 
+# 單股合理成本/損益平衡價上限，用來區分「價格」與「股數／市值」等大數字，並過濾離譜的辨識結果。
+MAX_PLAUSIBLE_COST = 5000
+
 REPORT_COLUMNS = [
     "股票代號",
     "股票名稱",
@@ -1068,15 +1071,13 @@ def parse_portfolio_candidate_line(
         normalized_part = part.replace(",", "").rstrip("%")
         is_numeric_token = bool(re.fullmatch(r"-?\d+(?:\.\d+)?", normalized_part))
 
-        if "%" in part:
-            profit_rate_seen = True
-
         if part not in OCR_NON_NAME_TOKENS and not is_numeric_token and not leading_name:
             name_tokens.append(part)
 
         if is_numeric_token and not normalized_part.startswith("-"):
             numeric_tokens.append(normalized_part)
-            # 券商持股摘要常把損益平衡價放在報酬率後面，優先採用該值作為成本基準。
+            # 券商持股摘要常把損益平衡價放在報酬率「之後」，優先採用第一個出現的值作為成本基準。
+            # profit_rate_seen 只在處理完前面的 token 後才設定，避免把報酬率本身（例如 5.23%）誤收。
             if profit_rate_seen and "." in normalized_part:
                 break_even_decimal_values.append(float(normalized_part))
 
@@ -1085,6 +1086,9 @@ def parse_portfolio_candidate_line(
 
         if is_numeric_token and not leading_name:
             break
+
+        if "%" in part:
+            profit_rate_seen = True
 
     name = leading_name or " ".join(name_tokens).strip(" :-|")
 
@@ -1104,18 +1108,20 @@ def parse_portfolio_candidate_line(
 
     if integer_values:
         share_candidate = integer_values[0]
-        if not decimal_values and len(integer_values) >= 2 and integer_values[0] <= 5000 < integer_values[1]:
+        if not decimal_values and len(integer_values) >= 2 and integer_values[0] <= MAX_PLAUSIBLE_COST < integer_values[1]:
             share_candidate = integer_values[1]
             if not decimal_values:
                 cost_value = float(integer_values[0])
         shares_value = share_candidate * share_unit_multiplier
 
-    if break_even_decimal_values:
-        cost_value = float(break_even_decimal_values[-1])
+    # 損益平衡價可能夾雜報酬率殘值或現價等不合理數字，先過濾出合理價位區間，再取「最先出現」的值。
+    plausible_break_even = [value for value in break_even_decimal_values if 0 < value <= MAX_PLAUSIBLE_COST]
+    if plausible_break_even:
+        cost_value = float(plausible_break_even[0])
     elif decimal_values:
         cost_value = float(decimal_values[0])
     elif len(integer_values) >= 2 and pd.isna(cost_value):
-        cost_candidates = [value for value in integer_values if 0 < value <= 5000]
+        cost_candidates = [value for value in integer_values if 0 < value <= MAX_PLAUSIBLE_COST]
         if cost_candidates:
             cost_value = float(min(cost_candidates))
 
